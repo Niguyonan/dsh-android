@@ -51,32 +51,32 @@ Two things the diagram is load-bearing for, both from §7 of the plan:
 
 ## Layout
 
+Everything in this table exists and is exercised by `tests/run.sh`.
+
 | Path | Phase | What it is |
 |---|---|---|
 | `bin/dshd` | 1, 4 | The on-device entry point: chroot/mount wrapper *plus* supervisor. POSIX `sh`, runs under Magisk's `mksh`. |
-| `tools/probe.sh` | 0 | Device feasibility probes → the P0 ledger (kernel, Landlock, `noexec`, SELinux, PTY, `xt_owner`). |
-| `tools/rootfs-setup.sh` | 1 | Fetch + unpack the glibc arm64 rootfs, skeleton dirs, DNS, glibc Node. |
-| `tools/install-harness.sh` | 2 | Install `@deepseek-ai/dsh` at a pinned version inside the rootfs. |
-| `tools/confinement-check.sh` | 3 | Decide and **prove** the confinement posture (Landlock denied-write, or disclosed fallback). |
-| `tools/firewall.sh` | §7 | Apply/remove/status the UID-owner rule that keeps other apps off both ports. |
-| `tools/backup.sh` | 6 | Deliberate backup of `DSH_HOME` (sessions *and* credentials). |
-| `tools/update.sh` | 6 | Version bump with smoke test and a known-good version kept for rollback. |
-| `tools/rollback.sh` | 6 | Revert to the previous pinned version. |
-| `tools/doctor.sh` | 6 | One-shot health snapshot: probes, posture, versions, mounts, ports. |
 | `guard/guard.mjs` | §7 | The token guard. Zero dependencies, Node built-ins only. |
-| `magisk/service.d/dshd.sh` | 4 | Optional boot-time autostart (opt-in; the APK owns lifecycle by default). |
-| `android/` | 5 | The WebView APK: viewer plus lifecycle owner, no harness logic. |
-| `docs/` | — | Probe ledger template, security design + proof procedure, runbook. |
-| `tests/run.sh` | — | Host-side entry point: the guard suite, then `dshd`'s lifecycle suite. |
-| `tests/dshd.test.sh` | — | `dshd`'s lifecycle without a device or root: exit codes, posture, rotation, supervisor pair semantics. |
 | `guard/test/guard.test.mjs` | §7 | Proves the guard's controls rather than asserting them: auth, Host/Origin, bind refusal, upgrade teardown. |
+| `tools/firewall.sh` | §7 | The reachability half of the mitigation: a UID-owner rule set that keeps every other app off both ports, self-verified after apply. |
+| `docs/security.md` | §7 | The exposure, the two controls, and the on-device procedure that proves a second app is blocked. |
+| `tests/run.sh` | — | Host-side entry point: the guard suite, the firewall suite, then `dshd`'s lifecycle suite. |
+| `tests/dshd.test.sh` | — | `dshd`'s lifecycle without a device or root: exit codes, posture, rotation, firewall handover, supervisor pair semantics. |
+| `tests/firewall.test.sh` | §7 | The rule set against a fake iptables: apply, verify, tamper detection, removal, idempotence. |
+
+**Not written yet** — named so that the quick start below reads as a plan rather
+than a description: `tools/probe.sh` (Phase 0), `tools/rootfs-setup.sh` (1),
+`tools/install-harness.sh` (2), `tools/confinement-check.sh` (3),
+`magisk/service.d/dshd.sh` (4), `android/` (5), `tools/backup.sh`,
+`tools/update.sh`, `tools/rollback.sh`, `tools/doctor.sh` (6),
+`docs/phase-0-probe-ledger.md` and `docs/runbook.md`.
 
 ## Quick start
 
 Host-side checks (any machine with Node and `sh`):
 
 ```sh
-tests/run.sh                 # exercises dshd's lifecycle logic + the guard
+tests/run.sh                 # the guard, the §7 rule set, and dshd's lifecycle
 ```
 
 On the device, from a root shell, in order — **do not skip a gate**:
@@ -86,9 +86,14 @@ sh /data/local/dsh/tools/probe.sh              # P0: fill docs/phase-0-probe-led
 sh /data/local/dsh/tools/rootfs-setup.sh       # P1: node -v inside the chroot reports glibc
 sh /data/local/dsh/tools/install-harness.sh    # P2: full agent round-trip
 sh /data/local/dsh/tools/confinement-check.sh  # P3: posture proven, not assumed
+sh /data/local/dsh/tools/firewall.sh apply --uid <APP_UID>   # §7: other app UIDs rejected
 sh /data/local/dsh/bin/dshd start              # P4: supervisor
-sh /data/local/dsh/tools/firewall.sh apply     # §7: other app UIDs rejected
 ```
+
+The firewall rule goes on **before** the supervisor, not after: it is what keeps
+other apps away from the ports the supervisor is about to open. Setting
+`DSH_FIREWALL=on` in `etc/dshd.conf` makes `dshd` re-apply it on every start, so
+it survives reboots; `docs/security.md` has the procedure that proves it works.
 
 Then install the APK, which starts, fronts, and stops all of the above.
 
@@ -103,8 +108,10 @@ proxying behaviour, including WebSocket upgrades and the teardown of upgraded so
 token handling, log rotation, exit codes) driven through its dry-run path; and the
 supervisor's pair semantics driven end-to-end against the *real* guard with a stand-in
 harness — kill either child and the other is torn down and the pair restarts, with the
-pid file proven (via `lsof`) to name the process that holds the port. `tests/run.sh`
-runs both suites.
+pid file proven (via `lsof`) to name the process that holds the port. Also the §7
+rule set: `tools/firewall.sh` is driven against a fake iptables through
+apply → verify → tamper → remove, including that a kernel without the owner match
+fails loudly instead of reporting success. `tests/run.sh` runs all of it.
 
 **Untestable off-device, and therefore still open:** every kernel-level question —
 Landlock availability, unprivileged user namespaces, `noexec` on `/data`, SELinux
@@ -136,6 +143,12 @@ that a device would have blamed on Android:
 - **The root refusal exited 1, not the documented 2.** The APK's health check
   distinguishes "not root" from every other failure, so the contract is now what the
   header says.
+- **The firewall script got none of its inputs.** `dshd` read `DSH_APP_UID` and the
+  ports from its own environment or a sourced `dshd.conf` and then ran
+  `firewall.sh` as a separate process without exporting any of them: the log said
+  "applying firewall rule (app uid: 10123)" while the script received nothing, which
+  is how a §7 control ends up installed against the wrong UID or not at all. The
+  values are exported now, and a test asserts what the script is handed.
 
 ## Corrections to the plan found while implementing
 
