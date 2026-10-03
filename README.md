@@ -81,11 +81,12 @@ your device. That is the product, and it is worth being deliberate about.
 ## Troubleshooting
 
 The app's **Log** toggle shows exactly what the device said. Most first runs fail
-in one of these four ways:
+in one of these five ways:
 
 | What you see | What to do |
 |---|---|
 | "root was not granted" | Open your root manager's Superuser list, check the app is allowed, then tap Retry. |
+| A failure naming **base** — the install directory | The app keeps its runtime in `/data/local/dsh` and will not run scripts from a directory another app could write to. It fixes a mode it can close and says so; if it refuses instead, the log says why, and `rm -rf /data/local/dsh` from a root shell then **Set up** again is the way back. |
 | Setup stops at *Installing the Linux base* | Almost always network or free space. The log names the file it could not fetch or verify. |
 | A warning banner about the sandbox | This device's kernel has no Landlock, or the launcher is missing. The harness still runs; the agent is not confined to its workspace. |
 | Setup stops at *Locking the ports* | This kernel has no `iptables` owner match, so other apps on the device cannot be kept off the ports. The log says so rather than installing a rule that does nothing. |
