@@ -1,7 +1,7 @@
 #!/bin/sh
 # Host-side test entry point for dsh-android.
 #
-# Nine suites, all runnable on any machine with `sh` (the guard suite and the
+# Ten suites, all runnable on any machine with `sh` (the guard suite and the
 # Phase 2 smoke test also need Node; the APK suite needs a JDK and an Android SDK
 # and skips, loudly, without them):
 #
@@ -32,6 +32,9 @@
 #     and what happens when the transfer is truncated, a file is tampered with,
 #     the install directory is writable by another uid, or there is no sha256 to
 #     verify with.
+#   * tests/docs.test.sh      — the documentation's checkable claims: every
+#     script and verb it names exists, every path in the README's layout table
+#     exists, and every suite in tests/ is one that runs.
 #   * tests/apk.test.sh       — android/build.sh and the APK it produces: a
 #     signed, verifiable artifact, its permissions and cleartext policy, the
 #     payload inside it compared byte for byte with the working tree, and

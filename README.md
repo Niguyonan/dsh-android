@@ -91,9 +91,11 @@ Everything in this table exists and is exercised by `tests/run.sh`.
 | `tools/mkpayload.sh` | 5 | Builds `android/assets/payload.tar` and `payload.id` from the working tree, reproducibly, and refuses to write an archive whose members are not exactly the manifested files. |
 | `boot/service.d/dshd.sh` | 4 | Opt-in boot autostart, installed at `/data/adb/service.d` — the path all three root solutions run. |
 | `docs/security.md` | §7 | The exposure, the two controls, and the on-device procedure that proves a second app is blocked. |
+| `docs/runbook.md` | 4, 5 | The device procedure: install, grant root, the seven steps and what each one costs, the P0–P5 gates with their pass conditions, proving both §7 controls by hand, troubleshooting by symptom, recovery — and the list of what has never been run. |
 | `docs/root-solutions.md` | — | Magisk vs KernelSU vs KernelSU-Next: detection, `su`, SELinux domains, boot scripts, mount namespaces. |
 | `docs/phase-0-probe-ledger.md` | 0 | The P0 template to fill in on the device, including the root-solution rows. |
-| `tests/run.sh` | — | Host-side entry point: the guard, firewall, probe, rootfs and harness-install suites, then `dshd`'s lifecycle suite. |
+| `tests/run.sh` | — | Host-side entry point: the ten suites below, and the only place a suite is registered. |
+| `tests/docs.test.sh` | — | The documentation's checkable claims: every script and verb it names exists, every path in the layout table exists, and every suite in `tests/` is one that runs. |
 | `tests/dshd.test.sh` | — | `dshd`'s lifecycle without a device or root: exit codes, posture, rotation, firewall handover, supervisor pair semantics. |
 | `tests/firewall.test.sh` | §7 | The rule set against a fake iptables: apply, verify, tamper detection, removal, idempotence. |
 | `tests/probe.test.sh` | 0 | `probe.sh`'s contract and verdicts with the device stubbed: it must fail loudly on a host, never quietly. |
@@ -104,8 +106,8 @@ Everything in this table exists and is exercised by `tests/run.sh`.
 | `tests/apk.test.sh` | 5 | The APK: signed and verified, its permissions and cleartext policy, the payload inside it compared byte for byte with the tree, and `Protocol.java` driven with the real `dshd`'s output. Skips loudly without a JDK and an SDK. |
 
 **Not written yet** — named so that what follows reads as a plan rather than a
-description: `tools/backup.sh`, `tools/update.sh`, `tools/rollback.sh`,
-`tools/doctor.sh` (6) and `docs/runbook.md`.
+description: `tools/backup.sh`, `tools/update.sh`, `tools/rollback.sh` and
+`tools/doctor.sh` (all Phase 6).
 
 ## Quick start
 
@@ -113,8 +115,8 @@ Host-side checks (any machine with Node and `sh`; the APK suite also wants a JDK
 and an Android SDK, and skips itself loudly without them):
 
 ```sh
-tests/run.sh                 # nine suites: guard, §7 rule set, probes, rootfs,
-                             # harness install, payload, setup, APK, dshd
+tests/run.sh                 # ten suites: docs, guard, §7 rule set, probes,
+                             # rootfs, harness install, payload, setup, APK, dshd
 ```
 
 **On a phone or tablet, the APK is the whole story.** Build it, install it, open
@@ -200,8 +202,9 @@ KernelSU and KernelSU-Next forward stdin to `su -c` (the payload arrives that
 way), what their root prompts look like and how they answer a refusal, whether
 the WebView's cookie store survives the way the guard's login needs it to, and
 whether a detached `setsid` supervisor outlives both the app being swiped away
-and a force-stop. Those are Gate P4/P5 rows; `docs/runbook.md` is where the
-procedure belongs and is not written yet.
+and a force-stop. Those are Gate P4/P5 rows, and
+[`docs/runbook.md`](./docs/runbook.md) is the procedure — including the list of
+everything in this stack that has never been executed on real hardware.
 
 **Root solutions:** the stack is written against uid 0 plus a working `su` rather
 than against Magisk. `dshd root` and `probe.sh` detect Magisk, KernelSU and
