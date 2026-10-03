@@ -260,3 +260,64 @@ The rest of the handling rules apply to both:
   history. `DSH_HOME` also holds `.credentials.yaml` — the harness's cookie
   **signing key** — so it is `0700`/`0600` throughout and is the single most
   sensitive directory in the deployment.
+
+## The APK holds root: what that means, and what was done about it
+
+Everything above assumes a root shell. On a phone there is no shell: the app is
+the root client, and that changes the threat model in one direction and the
+implementation in several.
+
+**What the app asks for.** Root, once, through whatever the root manager shows
+the user; the grant is per-app and revocable in Magisk's Superuser list or
+KernelSU's app profile. After that the app runs one command per action, and no
+root shell is held open between them: the server is a detached process that does
+not need the app alive, and the app is not a keep-alive for it. A run is a
+foreground service only so that Android does not kill a twenty-minute download.
+
+**What reaches a shell.** Every `su -c` argument is assembled from constants plus
+the app's own uid, which is read from the kernel (`Process.myUid()`) and checked
+to be digits before it is concatenated. No path, no preference, no text from the
+user or from the page ever reaches a command line. An app with root cannot afford
+a second place where a string becomes a command, so there is exactly one, in
+`Shell.bootstrapCommand`, and it is a constant.
+
+**How the payload gets there.** The app does not ask root to read its own private
+files: SELinux's answer to a `su` domain touching `app_data_file` differs between
+Magisk, KernelSU and KernelSU-Next, and a rule that happens to hold on one is not
+a design. Instead the payload is streamed into `su`'s stdin, extracted by `tar`
+into `/data/local/dsh/.stage`, and verified file by file against
+`payload.sha256` before a single file is installed. Installation is
+compare-then-rename, never write-in-place, because `bin/dshd` may be the running
+supervisor and a shell reads its own script incrementally.
+
+**What the bootstrap refuses.** A shell that is not uid 0 (exit 2, so the app can
+tell "no root granted" from everything else with one number). An install
+directory owned by another uid, or writable by group or other — whoever can write
+there decides which scripts root runs next. A payload file whose digest does not
+match. A device with no `sha256sum`, `shasum`, `openssl` or BusyBox: it refuses
+to install unverified files rather than install them unchecked.
+
+**What the WebView is allowed to do.** It renders the harness UI, which is agent
+output. So: no `addJavascriptInterface` (a bridge would connect agent output to a
+process holding root), `setAllowFileAccess(false)` and
+`setAllowContentAccess(false)`, mixed content never allowed, and navigation
+pinned to the loopback authority it loaded from — anything else opens in the
+system browser, where the user can see where it goes. The WebView is created in
+code with no view id, so the framework does not fold its state — which includes
+the tokenised URL it was handed — into the saved instance state.
+
+**What the app keeps on disk.** The guard's session cookie, in the WebView's
+cookie store inside the app's private data directory. That is the same boundary
+the rest of this stack relies on: file permissions plus file-based encryption,
+with `allowBackup="false"` so the cookie does not travel to a cloud backup. The
+token itself is never written to a preference, never logged, and is dropped from
+the WebView's history as soon as the page loads.
+
+**What none of this protects against.** An app that has already been granted
+root, a root manager that grants root to the wrong app, and the agent itself: the
+harness runs commands as root by design, and the confinement question —
+whether those commands are boxed into the workspace — is §7's Landlock half, not
+this one. A phone that is rooted and has this app installed has handed a language
+model a root shell. That is the point of the product, and the disclosures in
+`tools/confinement-check.sh` and on the app's status screen exist so that it is a
+decision rather than a surprise.
