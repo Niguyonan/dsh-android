@@ -125,7 +125,6 @@ tests/run.sh
 | [`docs/security.md`](docs/security.md) | The exposure, the controls, and what was measured rather than assumed |
 | [`docs/engineering.md`](docs/engineering.md) | How the port works, what is verified on a host, what still needs hardware, and the defects the tests caught |
 | [`docs/root-solutions.md`](docs/root-solutions.md) | Magisk vs KernelSU vs KernelSU-Next: what actually differs |
-| [`PORTING-PLAN.md`](PORTING-PLAN.md) | The plan this is the implementation of |
 
 ## Not affiliated
 
