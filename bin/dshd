@@ -25,7 +25,10 @@
 set -u
 
 DSHD_VERSION=1
-DSHD_SELF=$0
+# Where the supervisor re-executes itself from. Defaults to $0 (the on-device
+# case); tests/run.sh points it at a shim, because this file's shebang is
+# Android's /system/bin/sh and a host cannot exec it directly.
+: "${DSHD_SELF:=$0}"
 
 # ---------------------------------------------------------------------------
 # Defaults (overridable by the environment, then by $DSH_ETC/dshd.conf)
@@ -205,7 +208,12 @@ port_listening() {
 
 require_root() {
   [ "$DSHD_DRY_RUN" = 1 ] && return 0
-  [ "$(id -u)" = 0 ] || die "must run as root (chroot and bind mounts need it)"
+  # Exit 2 specifically: the APK's health check distinguishes "not root" from
+  # every other failure, so this cannot go through die()'s generic 1.
+  [ "$(id -u)" = 0 ] || {
+    log "ERROR: must run as root (chroot and bind mounts need it)" >&2
+    exit 2
+  }
 }
 
 ensure_dirs() {
@@ -347,8 +355,11 @@ umount_mounts() {
 # Child processes
 # ---------------------------------------------------------------------------
 
-# Run a command inside the rootfs: chroot normally, direct exec in the
-# development escape hatch (where in-rootfs paths are prefixed with DSH_ROOTFS).
+ROOTFS_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Run a command inside the rootfs, in the foreground: chroot normally, direct
+# exec in the development escape hatch (where in-rootfs paths are prefixed with
+# DSH_ROOTFS).
 exec_in_rootfs() {
   bin=$1
   shift
@@ -357,16 +368,42 @@ exec_in_rootfs() {
     # while a host path (a locally installed node, say) is already usable.
     target="$DSH_ROOTFS$bin"
     [ -x "$bin" ] && target="$bin"
-    env -i \
-      PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-      HOME=/root TMPDIR=/tmp LANG=C.UTF-8 \
-      "$target" "$@"
+    env -i PATH="$ROOTFS_PATH" HOME=/root TMPDIR=/tmp LANG=C.UTF-8 "$target" "$@"
   else
     chroot "$DSH_ROOTFS" /usr/bin/env -i \
-      PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-      HOME=/root TMPDIR=/tmp LANG=C.UTF-8 \
-      "$bin" "$@"
+      PATH="$ROOTFS_PATH" HOME=/root TMPDIR=/tmp LANG=C.UTF-8 "$bin" "$@"
   fi
+}
+
+# Start a command inside the rootfs in the background; sets $spawned_pid.
+#
+# The difference from exec_in_rootfs() is not cosmetic, and it is measured
+# rather than assumed: backgrounding a shell *function* (`exec_in_rootfs ... &`)
+# makes $! the wrapper subshell, and the real process is a grandchild that
+# survives SIGTERM to $!. `dshd stop` would then report success while the harness
+# kept running and holding its port. A backgrounded simple command is exec'd by
+# the forked shell, so $! is the process itself. Do not fold the two together.
+#
+# The child's stdout/stderr go to its own log file, never to the caller's, so a
+# caller that captures this function's output cannot be held open by the child.
+spawn_in_rootfs() {
+  log_file=$1
+  shift
+  spawned_pid=""
+  if [ "$DSHD_NO_CHROOT" = 1 ]; then
+    target="$DSH_ROOTFS$1"
+    [ -x "$1" ] && target="$1"
+    shift
+    env -i PATH="$ROOTFS_PATH" HOME=/root TMPDIR=/tmp LANG=C.UTF-8 \
+      "$target" "$@" >>"$log_file" 2>&1 &
+  else
+    bin=$1
+    shift
+    chroot "$DSH_ROOTFS" /usr/bin/env -i \
+      PATH="$ROOTFS_PATH" HOME=/root TMPDIR=/tmp LANG=C.UTF-8 \
+      "$bin" "$@" >>"$log_file" 2>&1 &
+  fi
+  spawned_pid=$!
 }
 
 node_bin() {
@@ -393,9 +430,9 @@ start_harness() {
   fi
   # 0<&- style detachment matters: the supervisor keeps its own log fds, and
   # the child must not hold the caller's terminal open.
-  exec_in_rootfs "$DSH_HARNESS_BIN" web --no-open --port "$DSH_HARNESS_PORT" \
-    >>"$DSH_LOG/harness.log" 2>&1 &
-  harness_pid=$!
+  spawn_in_rootfs "$DSH_LOG/harness.log" "$DSH_HARNESS_BIN" \
+    web --no-open --port "$DSH_HARNESS_PORT"
+  harness_pid=$spawned_pid
   printf '%s\n' "$harness_pid" >"$DSH_RUN/harness.pid"
   log "harness pid $harness_pid"
 }
@@ -412,12 +449,11 @@ start_guard() {
   if [ ! -f "$(in_rootfs_path "$DSH_GUARD_SCRIPT")" ]; then
     die "guard script missing at $(in_rootfs_path "$DSH_GUARD_SCRIPT") — run tools/rootfs-setup.sh"
   fi
-  exec_in_rootfs "$node" "$(in_rootfs_path "$DSH_GUARD_SCRIPT")" \
+  spawn_in_rootfs "$DSH_LOG/guard.log" "$node" "$(in_rootfs_path "$DSH_GUARD_SCRIPT")" \
     --listen "127.0.0.1:$DSH_GUARD_PORT" \
     --upstream "127.0.0.1:$DSH_HARNESS_PORT" \
-    --token-file "$token_file" \
-    >>"$DSH_LOG/guard.log" 2>&1 &
-  guard_pid=$!
+    --token-file "$token_file"
+  guard_pid=$spawned_pid
   printf '%s\n' "$guard_pid" >"$DSH_RUN/guard.pid"
   log "guard pid $guard_pid"
 }
@@ -480,6 +516,9 @@ supervise() {
   # Children are a pair: if either dies the other is torn down and the pair is
   # restarted, so a half-up system (guard up, harness dead) never persists.
   backoff=$DSH_BACKOFF_MIN
+  # Own the log directory: `dshd supervise` is also reachable directly, and
+  # start_harness/start_guard open log files before anything else creates them.
+  ensure_dirs
   log "supervisor started (base=$DSH_BASE, no_chroot=$DSHD_NO_CHROOT, dry_run=$DSHD_DRY_RUN)"
   trap 'log "supervisor received SIGTERM"; : >"$DSH_RUN/stop"' TERM INT
   run rm -f "$DSH_RUN/stop"
