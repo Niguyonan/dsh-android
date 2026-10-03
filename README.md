@@ -290,6 +290,27 @@ that a device would have blamed on Android:
   "applying firewall rule (app uid: 10123)" while the script received nothing, which
   is how a §7 control ends up installed against the wrong UID or not at all. The
   values are exported now, and a test asserts what the script is handed.
+- **The app refused the install directory it had just created.** Found on a real
+  device, which is the point of this entry: setup stopped, the screen said *the
+  payload did not verify*, and the log said `/data/local/dsh is mode 0775: group
+  or other writable`. Both halves were wrong, in different ways. The directory was
+  0775 because the app's command created it with `mkdir -p` under whatever umask
+  the `su` shell was started with — the mode check was correct and the *creation*
+  was the bug. And "the payload did not verify" was the app's summary for exit 6,
+  a code the bootstrap used for every refusal it could make, consulted *before* it
+  looked at whether the script had named the check that refused (it had not: the
+  bootstrap printed its refusals to the log and not on the protocol). So: the app
+  now creates the directory with `(umask 077; mkdir -p "$S")`, the bootstrap closes
+  a root-owned mode it can close and reports the before and after instead of
+  refusing, `chmod`'s exit status is not trusted (the mode is read back, and a
+  directory still writable by somebody else is fatal), a symlinked install
+  directory is refused rather than followed, a refusal carries its own exit code
+  (7, "the install directory is not safe", with 6 left meaning the payload did not
+  verify and nothing else), every refusal is emitted as `fail <step> <reason>` on
+  the protocol, and the app renders a named check before it renders a code. The
+  mode cases in `tests/payload.test.sh` use the real filesystem with only `id` and
+  the owner stubbed — a stubbed `stat` would have agreed with whatever the script
+  believed, which is exactly how this reached a phone.
 
 ## Corrections to the plan found while implementing
 
