@@ -328,7 +328,7 @@ probe_storage() {
     # still denied, and this is the probe that decides whether the whole
     # approach survives.
     marker="$dir/.dsh-probe-exec.$$"
-    if ! printf '#!%s\nprintf ok\\n' "$(command -v sh)" >"$marker" 2>/dev/null; then
+    if ! printf '#!%s\nprintf ok\n' "$(command -v sh)" >"$marker" 2>/dev/null; then
       warn "$dir is not writable by this shell"
       continue
     fi

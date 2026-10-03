@@ -64,6 +64,7 @@ Everything in this table exists and is exercised by `tests/run.sh`.
 | `guard/guard.mjs` | §7 | The token guard. Zero dependencies, Node built-ins only. |
 | `guard/test/guard.test.mjs` | §7 | Proves the guard's controls rather than asserting them: auth, Host/Origin, bind refusal, upgrade teardown. |
 | `tools/probe.sh` | 0 | Phase 0 device probes → the P0 ledger, with verdicts for D3, D6 and §7, and the root-solution block. |
+| `tools/rootfs-setup.sh` | 1 | Fetch + checksum-verify the glibc arm64 base and glibc Node, build the skeleton, write DNS, then run Gate P1 in a chroot. |
 | `tools/firewall.sh` | §7 | The reachability half of the mitigation: a UID-owner rule set that keeps every other app off both ports, self-verified after apply. |
 | `boot/service.d/dshd.sh` | 4 | Opt-in boot autostart, installed at `/data/adb/service.d` — the path all three root solutions run. |
 | `docs/security.md` | §7 | The exposure, the two controls, and the on-device procedure that proves a second app is blocked. |
@@ -73,12 +74,12 @@ Everything in this table exists and is exercised by `tests/run.sh`.
 | `tests/dshd.test.sh` | — | `dshd`'s lifecycle without a device or root: exit codes, posture, rotation, firewall handover, supervisor pair semantics. |
 | `tests/firewall.test.sh` | §7 | The rule set against a fake iptables: apply, verify, tamper detection, removal, idempotence. |
 | `tests/probe.test.sh` | 0 | `probe.sh`'s contract and verdicts with the device stubbed: it must fail loudly on a host, never quietly. |
+| `tests/rootfs-setup.test.sh` | 1 | `rootfs-setup.sh` with local tarballs instead of downloads: extraction, checksums, refusal to clobber, re-run paths. |
 
 **Not written yet** — named so that the quick start below reads as a plan rather
-than a description: `tools/rootfs-setup.sh` (1), `tools/install-harness.sh` (2),
-`tools/confinement-check.sh` (3), `android/` (5), `tools/backup.sh`,
-`tools/update.sh`, `tools/rollback.sh`, `tools/doctor.sh` (6) and
-`docs/runbook.md`.
+than a description: `tools/install-harness.sh` (2), `tools/confinement-check.sh`
+(3), `android/` (5), `tools/backup.sh`, `tools/update.sh`, `tools/rollback.sh`,
+`tools/doctor.sh` (6) and `docs/runbook.md`.
 
 ## Quick start
 
@@ -92,7 +93,7 @@ On the device, from a root shell, in order — **do not skip a gate**:
 
 ```sh
 sh /data/local/dsh/tools/probe.sh --save /data/local/dsh/log/p0.txt   # P0 gate
-sh /data/local/dsh/tools/rootfs-setup.sh       # P1: node -v inside the chroot reports glibc
+sh /data/local/dsh/tools/rootfs-setup.sh       # P1: fetches, verifies, and proves glibc
 sh /data/local/dsh/tools/install-harness.sh    # P2: full agent round-trip
 sh /data/local/dsh/tools/confinement-check.sh  # P3: posture proven, not assumed
 sh /data/local/dsh/tools/firewall.sh apply --uid <APP_UID>   # §7: other app UIDs rejected
@@ -128,8 +129,11 @@ rule set: `tools/firewall.sh` is driven against a fake iptables through
 apply → verify → tamper → remove, including that a kernel without the owner match
 fails loudly instead of reporting success. `tools/probe.sh` is exercised end to end
 with the device stubbed out: it must produce its verdicts, fail loudly on a host,
-and touch netfilter only through its own scratch chain. `tests/run.sh` runs all of
-it.
+and touch netfilter only through its own scratch chain. `tools/rootfs-setup.sh` is
+driven through local tarballs: checksum mismatches stop it before anything is
+installed, a second run refuses to clobber a rootfs without `--force`, a symlinked
+`resolv.conf` is replaced rather than written through, and `--skip-verify` says
+out loud that Gate P1 did not run. `tests/run.sh` runs all of it.
 
 **Root solutions:** the stack is written against uid 0 plus a working `su` rather
 than against Magisk. `dshd root` and `probe.sh` detect Magisk, KernelSU and

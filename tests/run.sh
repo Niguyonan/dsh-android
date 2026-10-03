@@ -1,7 +1,7 @@
 #!/bin/sh
 # Host-side test entry point for dsh-android.
 #
-# Four suites, all runnable on any machine with `sh` (the guard suite also needs
+# Five suites, all runnable on any machine with `sh` (the guard suite also needs
 # Node):
 #
 #   * guard/test/guard.test.mjs — the §7 guard: token auth, Host/Origin policy,
@@ -15,6 +15,9 @@
 #     fake iptables: apply, verify, tamper detection, removal, idempotence.
 #   * tests/probe.test.sh      — tools/probe.sh's contract and verdicts, with the
 #     device stubbed out: it must fail loudly on a host, not quietly.
+#   * tests/rootfs-setup.test.sh — tools/rootfs-setup.sh, with local tarballs
+#     instead of downloads: extraction, checksums, the refusal to clobber, and
+#     the paths that only break on a re-run.
 #
 # None of them can prove anything kernel-level: mounts, devpts, chroot,
 # Landlock and SELinux are Phase 0 probes on the device. See PORTING-PLAN.md §5.
@@ -38,6 +41,9 @@ sh tests/firewall.test.sh || failed=1
 
 printf '\n== Phase 0 probes ==\n'
 sh tests/probe.test.sh || failed=1
+
+printf '\n== Phase 1 rootfs ==\n'
+sh tests/rootfs-setup.test.sh || failed=1
 
 printf '\n== dshd lifecycle ==\n'
 sh tests/dshd.test.sh || failed=1
