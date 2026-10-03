@@ -1,0 +1,790 @@
+#!/system/bin/sh
+# dshd — DeepSeek Harness supervisor for rooted Android.
+#
+# Owns, for the glibc rootfs at $DSH_ROOTFS:
+#   * the bind mounts the chroot needs (/proc, /dev incl. /dev/pts, workspace, state)
+#   * the guard token and the confinement posture
+#   * the harness process (`dsh web --no-open --port <port>`) and the §7 token guard
+#   * start/stop/restart/status, crash restart with backoff, log rotation,
+#     stale-PID cleanup
+#
+# POSIX sh on purpose: this runs under Magisk's `mksh`, where bashisms like
+# [[ ]], arrays, and `wait -n` are not available. Run with `sh -n bin/dshd` to
+# syntax-check, and see tests/run.sh for the host-side lifecycle tests.
+#
+# Path model — the one thing to get right:
+#   The harness lives *inside* a chroot, so it cannot see /data/local/dsh.
+#   state/ and workspace/ are bind-mounted to /state and /workspace in there.
+#   Any absolute path handed to a child is therefore written in its own view
+#   ("in-rootfs"), and translated by in_rootfs_path() for the two host-side
+#   escape hatches: DSHD_NO_CHROOT=1 (development) and DSHD_DRY_RUN=1 (tests).
+#
+# Exit codes: 0 ok · 1 usage/config error · 2 not root · 3 not running ·
+#             4 start timed out
+
+set -u
+
+DSHD_VERSION=1
+DSHD_SELF=$0
+
+# ---------------------------------------------------------------------------
+# Defaults (overridable by the environment, then by $DSH_ETC/dshd.conf)
+# ---------------------------------------------------------------------------
+
+: "${DSH_BASE:=/data/local/dsh}"
+: "${DSH_ROOTFS:=$DSH_BASE/rootfs}"
+: "${DSH_STATE:=$DSH_BASE/state}"
+: "${DSH_WORKSPACE:=$DSH_BASE/workspace}"
+: "${DSH_ETC:=$DSH_BASE/etc}"
+: "${DSH_LOG:=$DSH_BASE/log}"
+: "${DSH_RUN:=$DSH_BASE/run}"
+
+# Paths as seen from inside the chroot.
+: "${DSH_STATE_IN:=/state}"
+: "${DSH_WORKSPACE_IN:=/workspace}"
+
+: "${DSH_HARNESS_PORT:=3080}"
+: "${DSH_GUARD_PORT:=3081}"
+: "${DSH_HARNESS_BIN:=/usr/local/bin/dsh}"
+: "${DSH_NODE:=/usr/local/bin/node}"
+: "${DSH_GUARD_SCRIPT:=/opt/dsh-android/guard.mjs}"
+
+: "${DSH_LOG_MAX_BYTES:=5242880}"   # 5 MiB per log before rotation
+: "${DSH_LOG_KEEP:=5}"              # rotated generations to keep
+: "${DSH_POLL_INTERVAL:=2}"         # supervisor child-liveness poll (seconds)
+: "${DSH_START_TIMEOUT:=90}"        # readiness wait after start (seconds)
+: "${DSH_STOP_TIMEOUT:=15}"         # grace before SIGKILL (seconds)
+: "${DSH_BACKOFF_MIN:=1}"
+: "${DSH_BACKOFF_MAX:=60}"
+: "${DSH_BACKOFF_RESET:=300}"       # uptime that forgives the backoff ladder
+
+: "${DSHD_NO_CHROOT:=0}"            # 1 = run children without chroot
+: "${DSHD_DRY_RUN:=0}"              # 1 = log mutating commands instead of running
+: "${DSH_FIREWALL:=off}"            # auto|on|off — see tools/firewall.sh
+: "${DSH_APP_UID:=}"                # owning app UID for the firewall rule
+: "${DSH_MOUNT_SYS:=0}"             # 1 = also bind /sys (not required by the plan)
+
+# Posture default is the plan's baseline; Phase 3 may pin the fallback instead.
+: "${DSH_PERMISSION_MODE:=}"
+
+CONF="$DSH_ETC/dshd.conf"
+if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090  # operator-provided overrides
+  . "$CONF"
+fi
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+log() {
+  printf '%s dshd[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$$" "$*"
+}
+
+die() {
+  log "ERROR: $*" >&2
+  exit 1
+}
+
+# Print a mutating command or run it, depending on DSHD_DRY_RUN.
+run() {
+  if [ "$DSHD_DRY_RUN" = 1 ]; then
+    log "dry-run: $*"
+    return 0
+  fi
+  "$@"
+}
+
+# Print a mutating command or run it, keeping stdout/stderr.
+run_show() {
+  if [ "$DSHD_DRY_RUN" = 1 ]; then
+    log "dry-run: $*"
+    return 0
+  fi
+  "$@"
+}
+
+# Translate an in-rootfs absolute path to a host path when chroot is disabled.
+in_rootfs_path() {
+  if [ "$DSHD_NO_CHROOT" = 1 ]; then
+    printf '%s%s\n' "$DSH_ROOTFS" "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+file_size() {
+  # Busybox/macOS stat are not compatible; wc -c reads the file portably.
+  wc -c <"$1" 2>/dev/null | tr -d ' '
+}
+
+now_seconds() { date '+%s'; }
+
+pid_alive() {
+  [ -n "$1" ] || return 1
+  kill -0 "$1" 2>/dev/null || return 1
+  # A zombie still answers kill -0, so a crashed child would look alive and
+  # would never be restarted. Check the state field in /proc/<pid>/stat. Field 2
+  # (comm) can contain spaces and parentheses, so cut at the first ')' rather
+  # than field-splitting.
+  if [ -r "/proc/$1/stat" ]; then
+    state=$(sed 's/^[^)]*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f1)
+    [ "$state" = Z ] && return 1
+  fi
+  return 0
+}
+
+# Reap a finished child so the supervisor does not accumulate zombies.
+reap() {
+  [ -n "$1" ] || return 0
+  wait "$1" 2>/dev/null || true
+}
+
+# True when $1 is alive and (where /proc is available) looks like our process.
+pid_is_ours() {
+  pid=$1
+  pattern=$2
+  pid_alive "$pid" || return 1
+  # Android has /proc; the host test bed does not. Without it we can only
+  # prove liveness, which is what the stale-PID sweep is allowed to act on.
+  [ -r "/proc/$pid/cmdline" ] || return 0
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "$pattern"
+}
+
+read_pid_file() {
+  [ -f "$1" ] || return 1
+  pid=$(tr -dc '0-9' <"$1" 2>/dev/null)
+  [ -n "$pid" ] || return 1
+  printf '%s\n' "$pid"
+}
+
+# Remove a PID file whose process is gone. Returns 0 when a stale file was
+# cleared, which is the difference between "was" and "is" in `status`.
+sweep_stale_pid() {
+  file=$1
+  pattern=$2
+  label=$3
+  [ -f "$file" ] || return 1
+  pid=$(read_pid_file "$file") || { run rm -f "$file"; return 0; }
+  if pid_is_ours "$pid" "$pattern"; then
+    return 1
+  fi
+  log "stale pid file $file (pid $pid, $label) — clearing"
+  run rm -f "$file"
+  return 0
+}
+
+# Is $1 a mountpoint? /proc/mounts is authoritative and available on Android.
+is_mounted() {
+  [ -r /proc/mounts ] || return 1
+  awk -v t="$1" '$2 == t { found = 1 } END { exit(found ? 0 : 1) }' /proc/mounts
+}
+
+# Is anything listening on loopback TCP port $1?
+# /proc/net/tcp is the dependency-free path (Android); nc is the host fallback.
+port_listening() {
+  port=$1
+  hex=$(printf '%04X' "$port")
+  for table in /proc/net/tcp /proc/net/tcp6; do
+    [ -r "$table" ] || continue
+    if awk -v p=":$hex" '$2 ~ p"$" && $4 == "0A" { found = 1 } END { exit(found ? 0 : 1) }' "$table"; then
+      return 0
+    fi
+  done
+  if [ -r /proc/net/tcp ]; then
+    return 1
+  fi
+  if command_exists nc; then
+    nc -z 127.0.0.1 "$port" >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  return 2
+}
+
+require_root() {
+  [ "$DSHD_DRY_RUN" = 1 ] && return 0
+  [ "$(id -u)" = 0 ] || die "must run as root (chroot and bind mounts need it)"
+}
+
+ensure_dirs() {
+  for d in "$DSH_BASE" "$DSH_STATE" "$DSH_WORKSPACE" "$DSH_ETC" "$DSH_LOG" "$DSH_RUN"; do
+    [ -d "$d" ] || run mkdir -p "$d"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Posture (§5 Phase 3 / D3)
+# ---------------------------------------------------------------------------
+
+# Resolution order: $DSH_PERMISSION_MODE env, then state/posture.conf, then the
+# plan baseline. A posture file written by tools/confinement-check.sh wins over
+# the baseline so the mode cannot drift per session.
+permission_mode() {
+  if [ -n "$DSH_PERMISSION_MODE" ]; then
+    printf '%s\n' "$DSH_PERMISSION_MODE"
+    return 0
+  fi
+  posture="$DSH_STATE/posture.conf"
+  if [ -f "$posture" ]; then
+    mode=$(sed -n 's/^permission_mode=//p' "$posture" | head -n 1)
+    if [ -n "$mode" ]; then
+      printf '%s\n' "$mode"
+      return 0
+    fi
+  fi
+  printf '%s\n' workspace-write
+}
+
+confinement_status() {
+  posture="$DSH_STATE/posture.conf"
+  [ -f "$posture" ] || { printf '%s\n' "unresolved (run tools/confinement-check.sh)"; return 0; }
+  sed -n 's/^confinement=//p' "$posture" | head -n 1
+}
+
+# ---------------------------------------------------------------------------
+# Token (§7)
+# ---------------------------------------------------------------------------
+
+token_path() { printf '%s\n' "$DSH_STATE/guard.token"; }
+
+ensure_token() {
+  token_file=$(token_path)
+  if [ -s "$token_file" ]; then
+    return 0
+  fi
+  if [ "$DSHD_DRY_RUN" = 1 ]; then
+    log "dry-run: would generate $token_file"
+    return 0
+  fi
+  mkdir -p "$(dirname "$token_file")"
+  if [ -r /dev/urandom ]; then
+    token=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+  else
+    token=$( (date '+%s'; cat /proc/sys/kernel/random/uuid 2>/dev/null) | cksum | tr -d ' ' )
+    log "WARNING: /dev/urandom unavailable; token entropy is weak"
+  fi
+  # umask before the redirect so the file is never briefly world-readable.
+  (umask 077; printf '%s\n' "$token" >"$token_file") || die "cannot write $token_file"
+  log "generated guard token at $token_file (0600)"
+}
+
+cmd_token() {
+  token_file=$(token_path)
+  [ -f "$token_file" ] || die "no token yet — start the supervisor first"
+  cat "$token_file"
+}
+
+# ---------------------------------------------------------------------------
+# Mounts (§5 Phase 1)
+# ---------------------------------------------------------------------------
+
+# /dev/pts is a separate filesystem type: binding /dev alone does not provide a
+# working devpts unless the bind is recursive, and a missing devpts silently
+# costs every PTY allocation (plan §3).
+mount_dev_pts() {
+  target="$DSH_ROOTFS/dev/pts"
+  [ -d "$target" ] || run mkdir -p "$target"
+  if is_mounted "$target"; then
+    return 0
+  fi
+  log "mounting devpts at $target"
+  run mount -t devpts devpts "$target" 2>/dev/null \
+    || run mount -t devpts -o gid=5,mode=620 devpts "$target" \
+    || log "WARNING: devpts mount failed — the PTY terminal will not work"
+}
+
+ensure_mounts() {
+  [ "$DSHD_NO_CHROOT" = 1 ] && return 0
+  for d in proc sys dev dev/pts tmp workspace state; do
+    [ -d "$DSH_ROOTFS/$d" ] || run mkdir -p "$DSH_ROOTFS/$d"
+  done
+
+  if ! is_mounted "$DSH_ROOTFS/proc"; then
+    log "mounting proc at $DSH_ROOTFS/proc"
+    run mount -t proc proc "$DSH_ROOTFS/proc" || die "cannot mount /proc into the rootfs"
+  fi
+
+  if [ "$DSH_MOUNT_SYS" = 1 ] && ! is_mounted "$DSH_ROOTFS/sys"; then
+    log "mounting sysfs at $DSH_ROOTFS/sys"
+    run mount -t sysfs sysfs "$DSH_ROOTFS/sys" || log "WARNING: sysfs mount failed"
+  fi
+
+  if ! is_mounted "$DSH_ROOTFS/dev"; then
+    log "mounting /dev (recursive bind) at $DSH_ROOTFS/dev"
+    # rec/rbind so /dev/pts, /dev/shm, /dev/mqueue come along if present.
+    run mount -o bind,rec /dev "$DSH_ROOTFS/dev" \
+      || run mount --rbind /dev "$DSH_ROOTFS/dev" \
+      || die "cannot bind /dev into the rootfs"
+  fi
+  mount_dev_pts
+
+  if ! is_mounted "$DSH_ROOTFS/workspace"; then
+    log "binding workspace at $DSH_ROOTFS/workspace"
+    run mount -o bind "$DSH_WORKSPACE" "$DSH_ROOTFS/workspace" || die "cannot bind the workspace"
+  fi
+  if ! is_mounted "$DSH_ROOTFS/state"; then
+    log "binding state at $DSH_ROOTFS/state"
+    run mount -o bind "$DSH_STATE" "$DSH_ROOTFS/state" || die "cannot bind DSH_HOME"
+  fi
+}
+
+umount_mounts() {
+  [ "$DSHD_NO_CHROOT" = 1 ] && return 0
+  # Reverse dependency order; every step is best-effort with a lazy fallback,
+  # so a half-mounted rootfs can still be torn down.
+  for d in state workspace dev/pts dev sys proc; do
+    target="$DSH_ROOTFS/$d"
+    is_mounted "$target" || continue
+    log "unmounting $target"
+    run umount "$target" 2>/dev/null || run umount -l "$target" 2>/dev/null \
+      || log "WARNING: could not unmount $target"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Child processes
+# ---------------------------------------------------------------------------
+
+# Run a command inside the rootfs: chroot normally, direct exec in the
+# development escape hatch (where in-rootfs paths are prefixed with DSH_ROOTFS).
+exec_in_rootfs() {
+  bin=$1
+  shift
+  if [ "$DSHD_NO_CHROOT" = 1 ]; then
+    # Dev mode: an in-rootfs path exists on this host only under $DSH_ROOTFS,
+    # while a host path (a locally installed node, say) is already usable.
+    target="$DSH_ROOTFS$bin"
+    [ -x "$bin" ] && target="$bin"
+    env -i \
+      PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+      HOME=/root TMPDIR=/tmp LANG=C.UTF-8 \
+      "$target" "$@"
+  else
+    chroot "$DSH_ROOTFS" /usr/bin/env -i \
+      PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+      HOME=/root TMPDIR=/tmp LANG=C.UTF-8 \
+      "$bin" "$@"
+  fi
+}
+
+node_bin() {
+  if [ "$DSHD_NO_CHROOT" = 1 ]; then
+    if [ -x "$DSH_ROOTFS$DSH_NODE" ]; then
+      printf '%s\n' "$DSH_NODE"
+    elif command_exists node; then
+      command -v node
+    else
+      printf '%s\n' node
+    fi
+  else
+    printf '%s\n' "$DSH_NODE"
+  fi
+}
+
+# The harness: `dsh web --no-open --port <port>`, loopback only, DSH_HOME=/state.
+start_harness() {
+  mode=$(permission_mode)
+  log "starting harness: dsh web --no-open --port $DSH_HARNESS_PORT (permission_mode=$mode)"
+  if [ "$DSHD_DRY_RUN" = 1 ]; then
+    log "dry-run: harness not started"
+    return 0
+  fi
+  # 0<&- style detachment matters: the supervisor keeps its own log fds, and
+  # the child must not hold the caller's terminal open.
+  exec_in_rootfs "$DSH_HARNESS_BIN" web --no-open --port "$DSH_HARNESS_PORT" \
+    >>"$DSH_LOG/harness.log" 2>&1 &
+  harness_pid=$!
+  printf '%s\n' "$harness_pid" >"$DSH_RUN/harness.pid"
+  log "harness pid $harness_pid"
+}
+
+# The §7 guard: token auth + Host/Origin allowlist in front of the harness.
+start_guard() {
+  node=$(node_bin)
+  token_file=$(in_rootfs_path "$(token_path)")
+  log "starting guard: $DSH_GUARD_SCRIPT on 127.0.0.1:$DSH_GUARD_PORT -> 127.0.0.1:$DSH_HARNESS_PORT"
+  if [ "$DSHD_DRY_RUN" = 1 ]; then
+    log "dry-run: guard not started"
+    return 0
+  fi
+  if [ ! -f "$(in_rootfs_path "$DSH_GUARD_SCRIPT")" ]; then
+    die "guard script missing at $(in_rootfs_path "$DSH_GUARD_SCRIPT") — run tools/rootfs-setup.sh"
+  fi
+  exec_in_rootfs "$node" "$(in_rootfs_path "$DSH_GUARD_SCRIPT")" \
+    --listen "127.0.0.1:$DSH_GUARD_PORT" \
+    --upstream "127.0.0.1:$DSH_HARNESS_PORT" \
+    --token-file "$token_file" \
+    >>"$DSH_LOG/guard.log" 2>&1 &
+  guard_pid=$!
+  printf '%s\n' "$guard_pid" >"$DSH_RUN/guard.pid"
+  log "guard pid $guard_pid"
+}
+
+kill_child() {
+  file=$1
+  label=$2
+  [ -f "$file" ] || return 0
+  pid=$(read_pid_file "$file") || { run rm -f "$file"; return 0; }
+  if ! pid_alive "$pid"; then
+    run rm -f "$file"
+    return 0
+  fi
+  log "stopping $label (pid $pid)"
+  run kill -TERM "$pid" 2>/dev/null
+  waited=0
+  while pid_alive "$pid" && [ "$waited" -lt "$DSH_STOP_TIMEOUT" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if pid_alive "$pid"; then
+    log "$label did not exit in ${DSH_STOP_TIMEOUT}s — SIGKILL"
+    run kill -KILL "$pid" 2>/dev/null
+  fi
+  # Reap it, or the supervisor accumulates a zombie per crash.
+  reap "$pid"
+  run rm -f "$file"
+}
+
+# Rotate $1 by renaming generations. Only safe between child restarts: a
+# running child holds the old fd and would keep writing to the renamed file.
+rotate_log() {
+  file=$1
+  [ -f "$file" ] || return 0
+  size=$(file_size "$file")
+  [ -n "$size" ] || return 0
+  [ "$size" -ge "$DSH_LOG_MAX_BYTES" ] || return 0
+  i=$DSH_LOG_KEEP
+  while [ "$i" -gt 1 ]; do
+    [ -f "$file.$((i - 1))" ] && run mv -f "$file.$((i - 1))" "$file.$i"
+    i=$((i - 1))
+  done
+  log "rotating $file (${size} bytes)"
+  run mv -f "$file" "$file.1"
+  run : >"$file"
+}
+
+rotate_logs() {
+  rotate_log "$DSH_LOG/harness.log"
+  rotate_log "$DSH_LOG/guard.log"
+}
+
+# ---------------------------------------------------------------------------
+# Supervisor
+# ---------------------------------------------------------------------------
+
+stop_requested() { [ -f "$DSH_RUN/stop" ]; }
+
+supervise() {
+  # Children are a pair: if either dies the other is torn down and the pair is
+  # restarted, so a half-up system (guard up, harness dead) never persists.
+  backoff=$DSH_BACKOFF_MIN
+  log "supervisor started (base=$DSH_BASE, no_chroot=$DSHD_NO_CHROOT, dry_run=$DSHD_DRY_RUN)"
+  trap 'log "supervisor received SIGTERM"; : >"$DSH_RUN/stop"' TERM INT
+  run rm -f "$DSH_RUN/stop"
+
+  stopping=0
+  while [ "$stopping" = 0 ]; do
+    rotate_logs
+    started_at=$(now_seconds)
+    start_harness
+    start_guard
+
+    # Liveness poll. Polling beats waiting on two children in POSIX sh, where
+    # `wait -n` is unavailable.
+    while [ "$stopping" = 0 ]; do
+      sleep "$DSH_POLL_INTERVAL"
+      if stop_requested; then
+        log "stop requested"
+        stopping=1
+        break
+      fi
+      dead=""
+      hp=$(read_pid_file "$DSH_RUN/harness.pid" 2>/dev/null) || hp=""
+      gp=$(read_pid_file "$DSH_RUN/guard.pid" 2>/dev/null) || gp=""
+      pid_alive "$hp" || dead="harness"
+      [ -n "$dead" ] || { pid_alive "$gp" || dead="guard"; }
+      if [ -n "$dead" ]; then
+        log "$dead exited"
+        break
+      fi
+    done
+
+    kill_child "$DSH_RUN/guard.pid" guard
+    kill_child "$DSH_RUN/harness.pid" harness
+
+    [ "$stopping" = 1 ] && break
+
+    uptime=$(( $(now_seconds) - started_at ))
+    if [ "$uptime" -ge "$DSH_BACKOFF_RESET" ]; then
+      backoff=$DSH_BACKOFF_MIN
+    fi
+    log "restarting pair in ${backoff}s (uptime ${uptime}s)"
+    sleep "$backoff"
+    backoff=$((backoff * 2))
+    [ "$backoff" -gt "$DSH_BACKOFF_MAX" ] && backoff=$DSH_BACKOFF_MAX
+  done
+
+  log "supervisor exiting"
+  run rm -f "$DSH_RUN/supervisor.pid" "$DSH_RUN/stop"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+preflight() {
+  require_root
+  [ -d "$DSH_ROOTFS" ] || die "rootfs not found at $DSH_ROOTFS — run tools/rootfs-setup.sh"
+  if [ "$DSHD_NO_CHROOT" = 1 ]; then
+    return 0
+  fi
+  [ -x "$DSH_ROOTFS$DSH_HARNESS_BIN" ] || die "harness not installed at $DSH_ROOTFS$DSH_HARNESS_BIN — run tools/install-harness.sh"
+  [ -x "$DSH_ROOTFS$DSH_NODE" ] || die "node not installed at $DSH_ROOTFS$DSH_NODE — run tools/rootfs-setup.sh"
+}
+
+apply_firewall_if_configured() {
+  script="$DSH_BASE/tools/firewall.sh"
+  case "$DSH_FIREWALL" in
+    on) [ -f "$script" ] || die "DSH_FIREWALL=on but $script is missing" ;;
+    auto) [ -f "$script" ] || return 0 ;;
+    *) return 0 ;;
+  esac
+  log "applying firewall rule (app uid: ${DSH_APP_UID:-unset})"
+  run sh "$script" apply >/dev/null 2>&1 || log "WARNING: firewall rule not applied"
+}
+
+cmd_start() {
+  preflight
+  ensure_dirs
+
+  sweep_stale_pid "$DSH_RUN/supervisor.pid" dshd supervisor
+  if pid=$(read_pid_file "$DSH_RUN/supervisor.pid") && pid_is_ours "$pid" dshd; then
+    log "already running (supervisor pid $pid)"
+    cmd_status
+    return 0
+  fi
+
+  ensure_mounts
+  ensure_token
+  apply_firewall_if_configured
+
+  if [ "$DSHD_DRY_RUN" = 1 ]; then
+    log "dry-run: supervisor not spawned"
+    return 0
+  fi
+
+  rm -f "$DSH_RUN/stop"
+  if command_exists setsid; then
+    setsid "$DSHD_SELF" supervise >>"$DSH_LOG/dshd.log" 2>&1 &
+  else
+    nohup "$DSHD_SELF" supervise >>"$DSH_LOG/dshd.log" 2>&1 &
+  fi
+  supervisor_pid=$!
+  printf '%s\n' "$supervisor_pid" >"$DSH_RUN/supervisor.pid"
+  log "supervisor pid $supervisor_pid"
+
+  log "waiting for readiness (up to ${DSH_START_TIMEOUT}s)"
+  waited=0
+  while [ "$waited" -lt "$DSH_START_TIMEOUT" ]; do
+    if port_listening "$DSH_HARNESS_PORT" && port_listening "$DSH_GUARD_PORT"; then
+      log "ready after ${waited}s"
+      cmd_status
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  log "ERROR: not ready after ${DSH_START_TIMEOUT}s — see $DSH_LOG/harness.log and $DSH_LOG/guard.log"
+  return 4
+}
+
+cmd_stop() {
+  require_root
+  ensure_dirs
+  : >"$DSH_RUN/stop"
+  if pid=$(read_pid_file "$DSH_RUN/supervisor.pid") && pid_alive "$pid"; then
+    log "signalling supervisor $pid"
+    run kill -TERM "$pid" 2>/dev/null
+    waited=0
+    while pid_alive "$pid" && [ "$waited" -lt "$DSH_STOP_TIMEOUT" ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    pid_alive "$pid" && run kill -KILL "$pid" 2>/dev/null
+  else
+    log "no supervisor running"
+  fi
+  # Belt and braces: the supervisor tears its children down, but a supervisor
+  # that was SIGKILLed cannot, so reap anything left holding a pid file.
+  kill_child "$DSH_RUN/guard.pid" guard
+  kill_child "$DSH_RUN/harness.pid" harness
+  run rm -f "$DSH_RUN/supervisor.pid" "$DSH_RUN/stop"
+  umount_mounts
+  log "stopped"
+}
+
+cmd_restart() {
+  cmd_stop
+  cmd_start
+}
+
+cmd_status() {
+  ensure_dirs
+  rc=0
+  sweep_stale_pid "$DSH_RUN/supervisor.pid" dshd supervisor
+  sweep_stale_pid "$DSH_RUN/harness.pid" "" harness
+  sweep_stale_pid "$DSH_RUN/guard.pid" "" guard
+
+  if pid=$(read_pid_file "$DSH_RUN/supervisor.pid"); then
+    printf 'supervisor:  running (pid %s)\n' "$pid"
+  else
+    printf 'supervisor:  stopped\n'
+    rc=3
+  fi
+
+  for pair in "harness:$DSH_RUN/harness.pid:$DSH_HARNESS_PORT" "guard:$DSH_RUN/guard.pid:$DSH_GUARD_PORT"; do
+    label=${pair%%:*}
+    rest=${pair#*:}
+    file=${rest%%:*}
+    port=${rest##*:}
+    if pid=$(read_pid_file "$file"); then
+      state=running
+    else
+      state=stopped
+      [ "$rc" = 0 ] && rc=3
+    fi
+    if port_listening "$port"; then
+      listen="listening"
+    elif [ "$?" = 2 ]; then
+      listen="unknown"
+    else
+      listen="not listening"
+      [ "$rc" = 0 ] && rc=3
+    fi
+    printf '%-11s %s (pid %s), port %s %s\n' "$label:" "$state" "${pid:-none}" "$port" "$listen"
+  done
+
+  printf 'permission:  %s\n' "$(permission_mode)"
+  printf 'confinement: %s\n' "$(confinement_status)"
+  printf 'firewall:    %s (app uid: %s)\n' "$DSH_FIREWALL" "${DSH_APP_UID:-unset}"
+  printf 'home:        %s (in-chroot %s)\n' "$DSH_STATE" "$DSH_STATE_IN"
+  printf 'workspace:   %s (in-chroot %s)\n' "$DSH_WORKSPACE" "$DSH_WORKSPACE_IN"
+  printf 'token:       %s\n' "$( [ -s "$(token_path)" ] && printf 'present' || printf 'absent')"
+
+  if [ -r /proc/mounts ]; then
+    printf 'mounts:     '
+    for d in proc dev dev/pts workspace state; do
+      if is_mounted "$DSH_ROOTFS/$d"; then
+        printf ' %s' "$d"
+      else
+        printf ' [%s MISSING]' "$d"
+      fi
+    done
+    printf '\n'
+  fi
+
+  if [ -x "$(in_rootfs_path "$DSH_ROOTFS$DSH_HARNESS_BIN")" ] || [ "$DSHD_NO_CHROOT" = 1 ]; then
+    version=$(
+      exec_in_rootfs "$DSH_HARNESS_BIN" --version 2>/dev/null | head -n 1
+    ) || version=""
+    [ -n "$version" ] && printf 'harness:     %s\n' "$version"
+  fi
+  return "$rc"
+}
+
+cmd_logs() {
+  ensure_dirs
+  follow=${1:-}
+  if [ "$follow" = "-f" ]; then
+    tail -n 40 -f "$DSH_LOG/dshd.log" "$DSH_LOG/harness.log" "$DSH_LOG/guard.log"
+    return 0
+  fi
+  for f in dshd harness guard; do
+    printf '=== %s.log (last 20) ===\n' "$f"
+    tail -n 20 "$DSH_LOG/$f.log" 2>/dev/null || printf '(none)\n'
+  done
+}
+
+cmd_doctor() {
+  ensure_dirs
+  printf 'dshd        %s\n' "$DSHD_VERSION"
+  printf 'base        %s\n' "$DSH_BASE"
+  printf 'rootfs      %s\n' "$DSH_ROOTFS"
+  printf 'no_chroot   %s\n' "$DSHD_NO_CHROOT"
+  printf 'dry_run     %s\n' "$DSHD_DRY_RUN"
+  printf 'config      %s\n' "$CONF"
+  cmd_status
+  if [ -f "$DSH_BASE/tools/doctor.sh" ] && [ "${1:-}" != "--status-only" ]; then
+    printf '\n--- tools/doctor.sh ---\n'
+    sh "$DSH_BASE/tools/doctor.sh" || true
+  fi
+}
+
+usage() {
+  cat <<EOF
+dshd $DSHD_VERSION — DeepSeek Harness supervisor for rooted Android
+
+usage: dshd <command> [args]
+
+  start              ensure mounts + token, spawn supervisor, wait for readiness
+  stop               stop children, tear down mounts
+  restart            stop then start
+  status             process, port, permission, confinement, mount summary
+  token              print the guard token (§7); the APK fetches this via su
+  logs [-f]          last lines of dshd/harness/guard logs, or follow
+  mounts             ensure the chroot bind mounts exist
+  umount             tear down the chroot bind mounts
+  rotate             rotate oversized logs (only safe while stopped)
+  doctor             status plus tools/doctor.sh, if installed
+
+Environment (or $CONF):
+  DSH_BASE        $DSH_BASE
+  DSH_HARNESS_PORT $DSH_HARNESS_PORT   (loopback only, never exposed)
+  DSH_GUARD_PORT  $DSH_GUARD_PORT   (the only port the app talks to)
+  DSH_FIREWALL    $DSH_FIREWALL   auto|on|off
+  DSH_APP_UID     ${DSH_APP_UID:-<unset>}
+  DSHD_NO_CHROOT  $DSHD_NO_CHROOT   (1 = dev mode: no chroot, no mounts)
+  DSHD_DRY_RUN    $DSHD_DRY_RUN   (1 = log instead of mutating)
+
+Exit codes: 0 ok · 1 usage · 2 not root · 3 not running · 4 start timed out
+EOF
+}
+
+cmd_mounts() {
+  require_root
+  ensure_dirs
+  ensure_mounts
+  for d in proc dev dev/pts workspace state; do
+    if is_mounted "$DSH_ROOTFS/$d"; then
+      printf 'mounted     %s\n' "$d"
+    else
+      printf 'NOT mounted %s\n' "$d"
+    fi
+  done
+}
+
+main() {
+  cmd=${1:-}
+  [ $# -gt 0 ] && shift
+
+  case "$cmd" in
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    restart) cmd_restart ;;
+    status) cmd_status ;;
+    token) cmd_token ;;
+    logs) cmd_logs "$@" ;;
+    mounts) cmd_mounts ;;
+    umount) require_root; umount_mounts ;;
+    rotate) ensure_dirs; rotate_logs ;;
+    doctor) cmd_doctor "$@" ;;
+    supervise) supervise ;;
+    version | --version) printf '%s\n' "$DSHD_VERSION" ;;
+    help | --help | -h | "") usage ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"
