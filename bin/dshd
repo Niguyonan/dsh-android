@@ -590,8 +590,29 @@ apply_firewall_if_configured() {
     auto) [ -f "$script" ] || return 0 ;;
     *) return 0 ;;
   esac
+  # The script is a separate process, and every value it needs came from the
+  # environment or from a sourced dshd.conf — neither of which exports anything.
+  # Without this the script receives none of its inputs, which is how a §7
+  # control gets installed against the wrong uid, or not at all, while the log
+  # says it was applied. tests/dshd.test.sh holds this to account.
+  export DSH_APP_UID DSH_HARNESS_PORT DSH_GUARD_PORT DSH_BASE DSH_ROOTFS DSH_STATE
   log "applying firewall rule (app uid: ${DSH_APP_UID:-unset})"
-  run sh "$script" apply >/dev/null 2>&1 || log "WARNING: firewall rule not applied"
+  if [ "$DSHD_DRY_RUN" = 1 ]; then
+    run sh "$script" apply
+    return 0
+  fi
+  # Keep the script's diagnosis. "not applied" with no reason is the least
+  # useful line in the log, and the reason is usually the whole answer: no
+  # iptables, or a kernel without the owner match.
+  out=$(sh "$script" apply 2>&1)
+  rc=$?
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out" | while IFS= read -r line; do
+      [ -n "$line" ] && log "firewall: $line"
+    done
+  fi
+  [ "$rc" = 0 ] || log "WARNING: firewall rule not applied (exit $rc) — the §7 mitigation is incomplete"
+  return 0
 }
 
 cmd_start() {

@@ -149,6 +149,16 @@ env_new() {
     DSH_HARNESS_PORT DSH_GUARD_PORT DSHD_NO_CHROOT DSHD_DRY_RUN \
     DSH_POLL_INTERVAL DSH_START_TIMEOUT DSH_STOP_TIMEOUT DSH_BACKOFF_MIN \
     DSH_BACKOFF_MAX DSH_LOG_MAX_BYTES DSH_LOG_KEEP
+
+  # Per-case hygiene: one case's exports must not decide the next case's
+  # behaviour (the firewall cases set DSH_FIREWALL=on on purpose).
+  unset DSH_PERMISSION_MODE 2>/dev/null || true
+  DSH_FIREWALL=off
+  DSH_APP_UID=""
+  export DSH_FIREWALL DSH_APP_UID
+
+  # The supervisor re-executes itself; give it an executable shim up front.
+  make_self_shim
 }
 
 env_free() {
@@ -623,6 +633,89 @@ case_orphaned_children() {
 }
 
 # ===========================================================================
+# 7. §7 firewall integration
+# ===========================================================================
+#
+# The rule set itself is tests/firewall.test.sh's job. What is tested here is the
+# handover: dshd must refuse to start when told to apply rules it cannot find,
+# and it must actually hand the script the uid and ports it needs. Before this
+# was tested, `firewall.sh apply` received none of its inputs.
+
+case_firewall_missing() {
+  env_new
+  DSH_FIREWALL=on
+  export DSH_FIREWALL
+  out=$(dshd start 2>&1)
+  rc=$?
+  check "DSH_FIREWALL=on with no script exits 1" "1" "$rc"
+  contains "and names the file it wanted" "tools/firewall.sh is missing" "$out"
+}
+
+# Start the supervisor, let it install the firewall, then take it down again.
+stop_quietly() {
+  SUPERVISOR_PID=$(pid_of "$DSH_RUN/supervisor.pid")
+  if alive "$SUPERVISOR_PID"; then
+    kill -TERM "$SUPERVISOR_PID" 2>/dev/null
+    wait_until 20 sh -c "! kill -0 $SUPERVISOR_PID 2>/dev/null"
+  fi
+  SUPERVISOR_PID=""
+}
+
+case_firewall_handover() {
+  env_new
+  DSHD_DRY_RUN=0
+  DSH_FIREWALL=on
+  DSH_APP_UID=10123
+  DSH_START_TIMEOUT=1 # readiness is not the subject here; the handover is
+  export DSHD_DRY_RUN DSH_FIREWALL DSH_APP_UID DSH_START_TIMEOUT
+  make_id_double
+  make_self_shim
+
+  mkdir -p "$DSH_BASE/tools"
+  cat >"$DSH_BASE/tools/firewall.sh" <<EOF
+#!/bin/sh
+# Stand-in: records what it was handed, and claims success.
+env | grep -E '^DSH_' | sort >"$TMP/handover.env"
+printf 'firewall: stand-in applied\n'
+exit 0
+EOF
+  chmod +x "$DSH_BASE/tools/firewall.sh"
+
+  out=$(dshd start 2>&1)
+  contains "start reports the firewall step" "applying firewall rule (app uid: 10123)" "$out"
+
+  handed=$(cat "$TMP/handover.env" 2>/dev/null)
+  contains "the script receives the app uid" "DSH_APP_UID=10123" "$handed"
+  contains "the script receives the harness port" "DSH_HARNESS_PORT=$DSH_HARNESS_PORT" "$handed"
+  contains "the script receives the guard port" "DSH_GUARD_PORT=$DSH_GUARD_PORT" "$handed"
+  contains "the script's own output reaches the log" "stand-in applied" "$out"
+  stop_quietly
+
+  # A script that fails must not be reported as a success.
+  env_new
+  DSHD_DRY_RUN=0
+  DSH_FIREWALL=on
+  DSH_APP_UID=10123
+  DSH_START_TIMEOUT=1
+  export DSHD_DRY_RUN DSH_FIREWALL DSH_APP_UID DSH_START_TIMEOUT
+  make_id_double
+  make_self_shim
+  mkdir -p "$DSH_BASE/tools"
+  cat >"$DSH_BASE/tools/firewall.sh" <<'EOF'
+#!/bin/sh
+printf 'iptables: owner: Invalid argument
+' >&2
+exit 4
+EOF
+  chmod +x "$DSH_BASE/tools/firewall.sh"
+
+  out=$(dshd start 2>&1)
+  contains "a failing firewall script is reported as incomplete" "the §7 mitigation is incomplete" "$out"
+  contains "and its diagnosis survives into the log" "owner: Invalid argument" "$out"
+  stop_quietly
+}
+
+# ===========================================================================
 
 case_syntax
 case_contract
@@ -635,6 +728,8 @@ case_start_idempotent
 case_stale_pid
 case_rotation
 case_supervise_loop
+case_firewall_missing
+case_firewall_handover
 case_real_pair
 case_orphaned_children
 
