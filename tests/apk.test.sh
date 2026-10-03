@@ -298,6 +298,15 @@ else
     check "and the payload id the app compares against" "$(cat "$TMP/assets/payload.id")" "$(cat "$TMP/from-apk.id")"
 
     unzip -l "$APK" | grep -q 'classes.dex' && pass "the APK has code in it" || fail "the APK has code in it"
+
+    # A *relative* --out, from the repository root, which is how the release
+    # workflow calls it. build.sh cd's into its build directory to package, so
+    # this is the case that put the APK somewhere nobody looked and let a release
+    # publish no artifact at all.
+    rm -rf "$TMP/rel" && mkdir -p "$TMP/rel"
+    ( cd "$TMP/rel" && sh "$BUILD" --out dist/relative.apk --no-payload >/dev/null 2>&1 )
+    check "a relative --out lands where the caller asked" "yes" \
+      "$([ -f "$TMP/rel/dist/relative.apk" ] && echo yes || echo no)"
   else
     fail "the APK exists"
   fi

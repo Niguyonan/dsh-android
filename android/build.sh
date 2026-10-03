@@ -135,6 +135,15 @@ sdk_tools() {
 
 sdk_tools || die 1 "no usable Android SDK. Set ANDROID_HOME (or ANDROID_SDK_ROOT, or pass --sdk DIR) to an SDK with build-tools, a platform, and android.jar."
 [ -n "$OUT" ] || OUT="$BUILD/dshd-$VERSION_NAME.apk"
+# Absolute before anything else: the packaging below happens after a `cd` into
+# the build directory, and a relative --out would be resolved against that
+# instead of against where the caller was standing. Every local run passed an
+# absolute path and never noticed; the release workflow passed `dist/...` and
+# published nothing.
+case "$OUT" in
+  /*) ;;
+  *) OUT="$(pwd)/$OUT" ;;
+esac
 
 for tool in javac keytool; do
   command -v "$tool" >/dev/null 2>&1 || die 1 "$tool is not on PATH (a JDK is required)"
