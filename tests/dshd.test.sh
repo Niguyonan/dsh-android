@@ -235,7 +235,11 @@ case_status_fresh() {
   contains "status reports confinement as unresolved" "confinement: unresolved (run tools/confinement-check.sh)" "$out"
   contains "status defaults to workspace-write" "permission: workspace-write" "$out"
   contains "status shows the in-chroot path model" "(in-chroot /state)" "$out"
-  contains "status names the root solution" "root: none (unknown)" "$out"
+  # The solution is "none" on any host; the parenthetical is the SELinux context,
+  # which is `unknown` where there is no /proc, `unconfined` on a Linux box with
+  # SELinux off, and a real domain on a device. Asserting the context pinned this
+  # to the machine it was written on.
+  contains "status names the root solution" "root: none (" "$out"
 }
 
 case_token_absent() {
