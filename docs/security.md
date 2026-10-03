@@ -121,13 +121,18 @@ month's kernel — re-run this procedure, and the Phase 0 probe table with it.
 Stated so that nobody mistakes the controls for something stronger:
 
 - **Root, and anything running as root.** The rules allow UID 0 by necessity, and
-  a rooted device has many ways to acquire it. This posture protects against
-  *other apps*, which is the actual threat model on a single-user device.
+  a rooted device has many ways to acquire it — under KernelSU, `su` is granted
+  per app by the manager, but the kernel-side root is one policy change away.
+  This posture protects against *other apps*, which is the actual threat model on
+  a single-user device.
 - **An app that shares the allowed UID** — including a compromised WebView
   process, or anything injected into it. The token lives in the app's process.
 - **A kernel without `xt_owner` or with SELinux blocking netfilter.** The script
   fails loudly (exit 4, with the reason in `dshd`'s log) rather than pretending,
-  but the exposure remains open until that is fixed.
+  but the exposure remains open until that is fixed. `tools/probe.sh` answers
+  whether the owner match exists before you rely on it, and the answer is a
+  property of your kernel, not of Magisk vs KernelSU — see
+  [`root-solutions.md`](./root-solutions.md).
 - **Shoulder-surfing, screenshots, and the notification.** Out of scope.
 - **Supply-chain risk in the harness itself.** Upstream is a developer preview;
   the version is pinned (`tools/install-harness.sh`) and rollback exists.

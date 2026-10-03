@@ -10,7 +10,7 @@ that rootfs, so there is **no native code to rebuild and no fork to maintain**.
 ## Architecture
 
 ```
-┌─ Magisk / root shell ────────────────────────────────────────────────────┐
+┌─ Magisk / KernelSU / KernelSU-Next root shell ───────────────────────────┐
 │  /data/local/dsh/                                                        │
 │    rootfs/       glibc arm64 rootfs (Debian/Ubuntu)                      │
 │    workspace/    agent working directory (ext4 — never noexec, never FUSE)│
@@ -48,6 +48,11 @@ Two things the diagram is load-bearing for, both from §7 of the plan:
   [`docs/security.md`](./docs/security.md).
 - **`/dev/pts` is a separate filesystem.** Binding `/proc` alone does not provide it,
   and every PTY allocation fails without it — silently costing the terminal.
+- **The root solution is not a detail.** Magisk patches the ramdisk, KernelSU and
+  KernelSU-Next patch the kernel, and the three differ in the `su` binary's path, the
+  SELinux domain `su` runs in, and whether a *new* root session sees mounts made by
+  this one. `dshd root` reports what it found; [`docs/root-solutions.md`](./docs/root-solutions.md)
+  records the differences and what must be probed rather than assumed.
 
 ## Layout
 
@@ -55,40 +60,50 @@ Everything in this table exists and is exercised by `tests/run.sh`.
 
 | Path | Phase | What it is |
 |---|---|---|
-| `bin/dshd` | 1, 4 | The on-device entry point: chroot/mount wrapper *plus* supervisor. POSIX `sh`, runs under Magisk's `mksh`. |
+| `bin/dshd` | 1, 4 | The on-device entry point: chroot/mount wrapper *plus* supervisor. POSIX `sh`, runs under Magisk's `mksh`, KernelSU's BusyBox `ash`, or a plain `sh -c`. |
 | `guard/guard.mjs` | §7 | The token guard. Zero dependencies, Node built-ins only. |
 | `guard/test/guard.test.mjs` | §7 | Proves the guard's controls rather than asserting them: auth, Host/Origin, bind refusal, upgrade teardown. |
+| `tools/probe.sh` | 0 | Phase 0 device probes → the P0 ledger, with verdicts for D3, D6 and §7, and the root-solution block. |
 | `tools/firewall.sh` | §7 | The reachability half of the mitigation: a UID-owner rule set that keeps every other app off both ports, self-verified after apply. |
+| `boot/service.d/dshd.sh` | 4 | Opt-in boot autostart, installed at `/data/adb/service.d` — the path all three root solutions run. |
 | `docs/security.md` | §7 | The exposure, the two controls, and the on-device procedure that proves a second app is blocked. |
+| `docs/root-solutions.md` | — | Magisk vs KernelSU vs KernelSU-Next: detection, `su`, SELinux domains, boot scripts, mount namespaces. |
+| `docs/phase-0-probe-ledger.md` | 0 | The P0 template to fill in on the device, including the root-solution rows. |
 | `tests/run.sh` | — | Host-side entry point: the guard suite, the firewall suite, then `dshd`'s lifecycle suite. |
 | `tests/dshd.test.sh` | — | `dshd`'s lifecycle without a device or root: exit codes, posture, rotation, firewall handover, supervisor pair semantics. |
 | `tests/firewall.test.sh` | §7 | The rule set against a fake iptables: apply, verify, tamper detection, removal, idempotence. |
+| `tests/probe.test.sh` | 0 | `probe.sh`'s contract and verdicts with the device stubbed: it must fail loudly on a host, never quietly. |
 
 **Not written yet** — named so that the quick start below reads as a plan rather
-than a description: `tools/probe.sh` (Phase 0), `tools/rootfs-setup.sh` (1),
-`tools/install-harness.sh` (2), `tools/confinement-check.sh` (3),
-`magisk/service.d/dshd.sh` (4), `android/` (5), `tools/backup.sh`,
-`tools/update.sh`, `tools/rollback.sh`, `tools/doctor.sh` (6),
-`docs/phase-0-probe-ledger.md` and `docs/runbook.md`.
+than a description: `tools/rootfs-setup.sh` (1), `tools/install-harness.sh` (2),
+`tools/confinement-check.sh` (3), `android/` (5), `tools/backup.sh`,
+`tools/update.sh`, `tools/rollback.sh`, `tools/doctor.sh` (6) and
+`docs/runbook.md`.
 
 ## Quick start
 
 Host-side checks (any machine with Node and `sh`):
 
 ```sh
-tests/run.sh                 # the guard, the §7 rule set, and dshd's lifecycle
+tests/run.sh                 # guard, §7 rule set, Phase 0 probes, dshd lifecycle
 ```
 
 On the device, from a root shell, in order — **do not skip a gate**:
 
 ```sh
-sh /data/local/dsh/tools/probe.sh              # P0: fill docs/phase-0-probe-ledger.md
+sh /data/local/dsh/tools/probe.sh --save /data/local/dsh/log/p0.txt   # P0 gate
 sh /data/local/dsh/tools/rootfs-setup.sh       # P1: node -v inside the chroot reports glibc
 sh /data/local/dsh/tools/install-harness.sh    # P2: full agent round-trip
 sh /data/local/dsh/tools/confinement-check.sh  # P3: posture proven, not assumed
 sh /data/local/dsh/tools/firewall.sh apply --uid <APP_UID>   # §7: other app UIDs rejected
 sh /data/local/dsh/bin/dshd start              # P4: supervisor
 ```
+
+`probe.sh` prints verdicts, not just output: whether the target paths are
+executable, whether the `su` context may mount, whether Landlock and `xt_owner`
+exist, and which root solution and `su` you are on. Fill
+[`docs/phase-0-probe-ledger.md`](./docs/phase-0-probe-ledger.md) in from it before
+Phase 1 — the plan hangs every later decision on that table.
 
 The firewall rule goes on **before** the supervisor, not after: it is what keeps
 other apps away from the ports the supervisor is about to open. Setting
@@ -111,7 +126,18 @@ harness — kill either child and the other is torn down and the pair restarts, 
 pid file proven (via `lsof`) to name the process that holds the port. Also the §7
 rule set: `tools/firewall.sh` is driven against a fake iptables through
 apply → verify → tamper → remove, including that a kernel without the owner match
-fails loudly instead of reporting success. `tests/run.sh` runs all of it.
+fails loudly instead of reporting success. `tools/probe.sh` is exercised end to end
+with the device stubbed out: it must produce its verdicts, fail loudly on a host,
+and touch netfilter only through its own scratch chain. `tests/run.sh` runs all of
+it.
+
+**Root solutions:** the stack is written against uid 0 plus a working `su` rather
+than against Magisk. `dshd root` and `probe.sh` detect Magisk, KernelSU and
+KernelSU-Next (they share `/data/adb/ksu` and `/data/adb/ksud`, so they differ only
+by version string and manager package), report the SELinux domain actually in use,
+and resolve `su` across all five places it lives. What differs per solution — and
+what therefore has to be probed on your device — is in
+[`docs/root-solutions.md`](./docs/root-solutions.md).
 
 **Untestable off-device, and therefore still open:** every kernel-level question —
 Landlock availability, unprivileged user namespaces, `noexec` on `/data`, SELinux
