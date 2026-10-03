@@ -143,12 +143,6 @@ stage_files() {
     cp "$ROOT/$src" "$STAGE/$dst" || die 1 "cannot copy $src"
     chmod "$mode" "$STAGE/$dst" || die 1 "cannot chmod $dst"
   done <"$LIST"
-  # One fixed timestamp for every member, so the archive is a function of the
-  # sources and nothing else. Without it a rebuild carries the clock, and
-  # "the APK ships the payload in this tree" becomes unprovable by comparison —
-  # see tests/apk.test.sh, which cmp(1)s the two.
-  find "$STAGE" -type f -exec touch -t 200001010000 {} + 2>/dev/null ||
-    touch -t 200001010000 "$STAGE"/*/* 2>/dev/null || true
 }
 
 # <mode> <sha256> <path>, sorted by path, which is also the order the id covers.
@@ -225,6 +219,16 @@ build() {
     printf '# the files below are the manifest: <mode> <sha256> <path>\n'
     printf '%s\n' "$BODY"
   } >"$STAGE/payload.sha256" || die 3 "cannot write the manifest"
+
+  # One fixed timestamp for every member, applied *after* the last file has been
+  # written -- and to directories as well as files. Both details were learned the
+  # hard way: `find -type f` leaves directory entries carrying the build clock,
+  # and doing it before the manifest is written leaves the manifest's own header
+  # carrying it. A tar header stores whole seconds, so two builds in the same one
+  # agree either way, which is how a reproducibility check passes while proving
+  # nothing and then fails a byte-for-byte comparison a second later.
+  find "$STAGE" -exec touch -t 200001010000 {} + 2>/dev/null ||
+    touch -t 200001010000 "$STAGE" "$STAGE"/* "$STAGE"/*/* 2>/dev/null || true
 
   mkdir -p "$dest" || die 1 "cannot create $dest"
   tar_cmd "$dest/payload.tar" bin tools guard boot bootstrap.sh payload.sha256 || die 3 "tar failed"

@@ -256,11 +256,17 @@ that a device would have blamed on Android:
   produced `""`, and `""` is a perfectly good thing to compare against nothing.
   Every hashing helper in the payload and the builder now fails when it cannot
   produce a digest, and the bootstrap refuses to install unverified files.
-- **The payload was not reproducible.** A build timestamp in the manifest meant
-  two builds of the same tree produced different bytes, which quietly made "the
-  APK ships the payload in this tree" unprovable. The archive is now a function
-  of the sources — fixed order, modes and mtimes, no timestamp — and
-  `tests/apk.test.sh` `cmp`s the two.
+- **The payload was not reproducible, twice over.** A build timestamp in the
+  manifest meant two builds of the same tree produced different bytes, which
+  quietly made "the APK ships the payload in this tree" unprovable. Removing it
+  was not enough: the fixed-mtime pass ran `find -type f` before the manifest was
+  written, so directory entries and the manifest's own header still carried the
+  clock. A tar header stores whole seconds, so both bugs passed a
+  same-second rebuild test — and then failed a byte-for-byte comparison a second
+  later, in a different suite, roughly two runs in three. The archive is a
+  function of the sources now, and `tests/payload.test.sh` rebuilds across a
+  one-second gap on purpose, because that is the only version of this check that
+  can fail.
 - **`String.join` and `Process.waitFor(long, TimeUnit)` are API 26.** The app
   declares minSdk 24, so both are `NoSuchMethodError` crashes on an Android 7
   device and nothing on a laptop would notice. The bounded wait is hand-rolled,

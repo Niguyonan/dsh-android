@@ -206,8 +206,20 @@ check "the only tool missing from the payload is the optional doctor.sh" " docto
 
 printf '\n== payload id ==\n'
 
+cp "$ASSETS/payload.tar" "$TMP/first.tar"
+# A second apart on purpose: a tar header stores whole seconds, so two builds in
+# the same one agree even when the archive carries the clock. This check spent a
+# while proving nothing for that reason, and the flake it caused showed up in a
+# different suite.
+sleep 1
 sh "$MK" --out "$ASSETS" --quiet
 check "a rebuild produces the same id" "$ID" "$(cat "$ASSETS/payload.id")"
+if cmp -s "$TMP/first.tar" "$ASSETS/payload.tar"; then
+  pass "a rebuild a second later is byte-identical"
+else
+  fail "a rebuild a second later is byte-identical" \
+    "$(cmp -l "$TMP/first.tar" "$ASSETS/payload.tar" 2>&1 | head -2 | tr '\n' ' ')"
+fi
 
 BACKUP="$TMP/bootstrap.sh.orig"
 cp "$REPO/android/payload/bootstrap.sh" "$BACKUP"
