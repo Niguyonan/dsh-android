@@ -227,8 +227,16 @@ build() {
   # carrying it. A tar header stores whole seconds, so two builds in the same one
   # agree either way, which is how a reproducibility check passes while proving
   # nothing and then fails a byte-for-byte comparison a second later.
-  find "$STAGE" -exec touch -t 200001010000 {} + 2>/dev/null ||
-    touch -t 200001010000 "$STAGE" "$STAGE"/* "$STAGE"/*/* 2>/dev/null || true
+  #
+  # TZ=UTC0, because `touch -t` reads its argument as *local* time: without it the
+  # same source tree built in UTC+8 and on a UTC runner produced archives that
+  # differed in the mtime field of every header, while the payload id -- which is
+  # over the manifest body, not over the tar bytes -- matched. That is exactly the
+  # shape of failure this pass exists to prevent, one level down: the archive is
+  # not a function of the tree, and the check that should have caught it compares
+  # two builds from the same machine, where the timezone cancels out.
+  TZ=UTC0 find "$STAGE" -exec touch -t 200001010000 {} + 2>/dev/null ||
+    TZ=UTC0 touch -t 200001010000 "$STAGE" "$STAGE"/* "$STAGE"/*/* 2>/dev/null || true
 
   mkdir -p "$dest" || die 1 "cannot create $dest"
   tar_cmd "$dest/payload.tar" bin tools guard boot bootstrap.sh payload.sha256 || die 3 "tar failed"
