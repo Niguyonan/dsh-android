@@ -67,12 +67,16 @@ make_env() {
   FW_LOG="$TMP/invocations"
   # The built-in chains exist before anything is created, exactly as on a device.
   {
-    printf 'chain PREROUTING\n'
-    printf 'chain INPUT\n'
-    printf 'chain FORWARD\n'
-    printf 'chain OUTPUT\n'
-    printf 'chain POSTROUTING\n'
-  } >"$FW_STATE"
+    for f in "$FW_STATE" "$FW_STATE.v6"; do
+      {
+        printf 'chain PREROUTING\n'
+        printf 'chain INPUT\n'
+        printf 'chain FORWARD\n'
+        printf 'chain OUTPUT\n'
+        printf 'chain POSTROUTING\n'
+      } >"$f"
+    done
+  }
   : >"$FW_LOG"
   mkdir -p "$TMP/bin"
 
@@ -81,7 +85,12 @@ make_env() {
 # Fake iptables: just enough CLI to hold a rule table in a file, so the tool's
 # logic is testable without netfilter. State lines are "chain NAME" and
 # "rule NAME <args>".
-state=${FW_STATE:?}
+# One table per program: a device has both iptables and ip6tables, and if they
+# shared a state file the v6 side would see the v4 chains already present.
+case "$0" in
+  *ip6tables) state="${FW_STATE:?}.v6" ;;
+  *) state="${FW_STATE:?}" ;;
+esac
 printf '%s %s\n' "$0" "$*" >>"${FW_LOG:-/dev/null}"
 cmd=${1:-}
 shift
@@ -146,6 +155,12 @@ esac
 exit 0
 EOS
   chmod +x "$TMP/bin/iptables"
+  # ip6tables too. The tool uses it when it exists, and it exists on a GitHub
+  # runner even though it does not exist on the macOS host this suite was
+  # written on -- so without this the suite passed here and failed there, with
+  # `print` (run with a scrubbed PATH) disagreeing with `apply` (run with the
+  # full one) about rules nobody had stubbed.
+  cp "$TMP/bin/iptables" "$TMP/bin/ip6tables"
 
   # firewall.sh refuses to touch netfilter as non-root; the tests are not root.
   cat >"$TMP/bin/id" <<EOF
@@ -293,10 +308,12 @@ case_remove() {
 case_single_port() {
   make_env
   out=$(fw print --uid "$APP_UID" --ports 3081,3081 2>&1)
-  check "a duplicated port is collapsed" "1" "$(printf '%s\n' "$out" | grep -c -- '-A DSH_ANDROID .*--dport 3081 -j REJECT')"
+  check "a duplicated port is collapsed" "1" \
+    "$(printf '%s\n' "$out" | grep -v ip6tables | grep -c -- '-A DSH_ANDROID .*--dport 3081 -j REJECT')"
   out=$(fw print --uid "$APP_UID" --ports 3081 2>&1)
   contains "one port applies to both ends when only one is given" "-A DSH_ANDROID -o lo -p tcp --dport 3081 -m owner --uid-owner 0 -j ACCEPT" "$out"
-  check "the single-port rule set has one reject per port" "1" "$(printf '%s\n' "$out" | grep -c -- '--dport 3081 -j REJECT')"
+  check "the single-port rule set has one reject per port" "1" \
+    "$(printf '%s\n' "$out" | grep -v ip6tables | grep -c -- '--dport 3081 -j REJECT')"
 }
 
 # ===========================================================================
