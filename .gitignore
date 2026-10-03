@@ -1,0 +1,19 @@
+# Machine-local agent/tooling config. Not project content: it holds a
+# per-session command allowlist that means nothing on another machine.
+reasonix.toml
+
+# Android build outputs
+android/local.properties
+android/.gradle/
+android/build/
+android/app/build/
+android/.gradle-dist/
+android/gradle/wrapper/gradle-wrapper.jar
+*.apk
+*.keystore
+!android/keystore/README.md
+
+# Scratch
+tmp/
+*.log
+.DS_Store
