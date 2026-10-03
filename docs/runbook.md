@@ -131,6 +131,22 @@ because it reports success. The app passes its own; from a shell you can read it
 with `dumpsys package dev.dshd.app | grep userId=` (Android 11+) or
 `stat -c %u /data/data/dev.dshd.app`.
 
+### The install directory, when a setup refuses to use it
+
+`/data/local/dsh` is where root-executed scripts live, so the bootstrap makes it
+0700 before installing anything, and will not install into a directory it cannot
+close. It reports each case on the protocol, with the reason, as `fail base`:
+
+| What it finds | What it does |
+|---|---|
+| A mode that is not 0700, owned by root | closes it to 0700 and says so in the log (`was mode 0775; it is mode 0700 now`). This is what an install directory created by an older build looks like |
+| Owned by another uid | refuses (exit 7): that uid would decide what root runs |
+| A symlink in its place, or an install directory inside it (`bin`, `tools`, `guard`, `boot/service.d`) that is one | refuses (exit 7): root would write wherever it points |
+
+To recover: `rm -rf /data/local/dsh` from a root shell, then tap **Set up** again.
+The payload is verified by digest on the way back in, so nothing else is lost
+except `state/` — see §9 if that matters.
+
 ## 5. Fill in the gates
 
 The plan's gates are not ceremony: each one is the evidence for a decision that
@@ -212,6 +228,7 @@ measurement — but it is the half that stops a stranger reaching it.
 
 | Symptom | Most likely cause | What to run |
 |---|---|---|
+| Setup stops before *Checking what this device can do* | Root was not granted (exit 2), or the install directory is not safe (exit 7) — the screen names the check and quotes its reason | grant root in the manager; for exit 7, see §5's note on `/data/local/dsh` |
 | Setup stops at *Checking what this device can do* | Storage is `noexec`, or `su` cannot mount | `sh tools/probe.sh` and read the `fail` lines; `log/p0.txt` |
 | Stops at *Installing the Linux system* | Checksum mismatch or no network | the raw log above the step; the script names the file and the URL |
 | Says the Linux base exists but is incomplete | A previous run died mid-extract | `sh bin/dshd setup --app-uid N --replace-rootfs` (deletes `rootfs/`) |
@@ -279,6 +296,11 @@ description of something observed:
 - what each manager's root prompt looks like, and how a *refusal* is reported —
   the app distinguishes "not root" by exit code 2 from the bootstrap, and by the
   absence of an `ok root` event.
+- what umask a `su` shell starts with, on each manager. The first version of the
+  app left that to the shell and got a 0775 install directory on a real device,
+  which the bootstrap then refused and the app reported as a bad payload. The app
+  now creates it under `umask 077` and the bootstrap closes a mode it can close,
+  but the umask itself is unmeasured here.
 - whether the WebView's cookie store persists the guard's session the way the
   login needs it to.
 - Landlock: availability, ABI, and whether the deny is really denied. The script

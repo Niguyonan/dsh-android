@@ -270,20 +270,32 @@ public final class Protocol {
             if (exitCode == null) {
                 return "the run did not finish";
             }
-            if (exitCode.intValue() == 2) {
-                return "root was not granted";
-            }
-            if (exitCode.intValue() == 6) {
-                return "the payload did not verify";
-            }
-            // A named step is the best diagnosis available, whether or not the
-            // run got as far as closing itself out with a done event.
+            // A named step is the best diagnosis available, so it comes first:
+            // the script that refused knows why it refused, and its sentence
+            // beats any summary this class could derive from a number. This
+            // order is a fix, not a preference. The exit-code lines used to be
+            // checked first, and exit 6 covered both "the payload did not
+            // verify" and every other refusal the bootstrap could make — so a
+            // root-owned directory left at 0775 by a previous run was reported
+            // to the screen as a corrupt payload, and the person reading it went
+            // looking in the wrong place. The codes below are the fallback for a
+            // stream that named no step: an older payload on the device, or a
+            // run killed before it finished a sentence.
             if (failStep != null) {
                 String why = "setup failed at " + failStep;
                 if (!failDetail.isEmpty()) {
                     why = why + ": " + failDetail;
                 }
                 return why;
+            }
+            if (exitCode.intValue() == 2) {
+                return "root was not granted";
+            }
+            if (exitCode.intValue() == 6) {
+                return "the payload did not verify";
+            }
+            if (exitCode.intValue() == 7) {
+                return "the install directory is not safe";
             }
             if (doneOk == null) {
                 return "the setup stopped without saying why (exit " + exitCode + ")";

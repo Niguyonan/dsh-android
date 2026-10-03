@@ -15,10 +15,19 @@ import java.util.List;
  * Everything this app does on the device, it does through one command.
  *
  * <pre>
- *   S=/data/local/dsh/.stage; rm -rf "$S"; mkdir -p "$S"
+ *   S=/data/local/dsh/.stage; rm -rf "$S"; (umask 077; mkdir -p "$S")
  *     &amp;&amp; tar -xf - -C "$S"                       &lt;- the payload, on stdin
  *     &amp;&amp; exec sh "$S/bootstrap.sh" &lt;verb&gt; ...     &lt;- verify, install, hand over
  * </pre>
+ *
+ * <p>The {@code mkdir} runs in a subshell with {@code umask 077}, so the staging
+ * directory — and {@code /data/local/dsh} above it, on a first run — is created
+ * 0700 whatever umask the {@code su} shell was started with. That directory is
+ * where root executes scripts from, and the first version of this command let it
+ * be created by whatever the su shell happened to carry: on a real device that
+ * was 0775, which the bootstrap then refused, which the app reported as a bad
+ * payload. The bootstrap checks and fixes that mode as well; a directory that
+ * decides what root runs should not be created permissive in the first place.
  *
  * <p>The payload is streamed in rather than read from the app's own directory on
  * purpose. Reading app-private files as root depends on SELinux letting a `su`
@@ -99,7 +108,7 @@ public final class Shell {
             throw new IllegalArgumentException("not a dshd verb: " + verb);
         }
         StringBuilder b = new StringBuilder();
-        b.append("S=").append(STAGE).append("; rm -rf \"$S\"; mkdir -p \"$S\"")
+        b.append("S=").append(STAGE).append("; rm -rf \"$S\"; (umask 077; mkdir -p \"$S\")")
          .append(" && tar -xf - -C \"$S\"")
          .append(" && exec sh \"").append(BOOTSTRAP).append("\" ").append(verb);
         if (extra != null && extra.length() > 0) {

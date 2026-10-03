@@ -8,7 +8,7 @@
 #
 # The app runs it like this, with the payload's tar on stdin:
 #
-#   su -c 'S=/data/local/dsh/.stage; rm -rf "$S"; mkdir -p "$S" &&
+#   su -c 'S=/data/local/dsh/.stage; rm -rf "$S"; (umask 077; mkdir -p "$S") &&
 #          tar -xf - -C "$S" && exec sh "$S/bootstrap.sh" setup --app-uid 10123'
 #
 # Every word of that is a constant in android/src/.../Shell.java, except the uid,
@@ -18,16 +18,25 @@
 #
 #   1. refuse to run as anything but root (exit 2), so the app can tell "no root
 #      granted" from every other failure with one number
-#   2. refuse a DSH_BASE that another uid could write to. This directory is where
-#      root-executed scripts live: if anything but root owns it, or anyone else
-#      can write in it, then whoever that is decides what root runs next
+#   2. make DSH_BASE safe before installing into it: it is where root-executed
+#      scripts live, so it has to be a real directory, owned by root, that nobody
+#      else can write to. A root-owned directory whose group or other write bits
+#      are set is closed here rather than refused. It used to be refused, and on
+#      a first run that directory had just been created by the app's own mkdir
+#      under whatever umask the su shell was started with — so the setup refused
+#      the directory it had made a line earlier and the person holding the phone,
+#      who has no terminal by design, had nowhere to go. What cannot be fixed
+#      still refuses: an owner that is not root, a symlink, a chmod that did not
+#      take. See tests/payload.test.sh for both halves of that
 #   3. extract the tar, then verify every file against payload.sha256 *before*
 #      installing any of it. A payload that arrived truncated fails here, by
 #      digest, instead of half-installing and half-working
 #   4. install with compare-then-rename, never by writing in place: bin/dshd may
 #      be the running supervisor, and a shell reads its own script incrementally,
 #      so truncating it under a live process makes the next line it parses come
-#      from the new file at the old offset
+#      from the new file at the old offset. Every directory it installs into is
+#      made safe first, and a symlinked one is refused: a link there decides where
+#      root writes
 #   5. exec dshd, preserving its exit status
 #
 # Why the payload is an uncompressed tar: the only extractor guaranteed here is
@@ -37,10 +46,14 @@
 #
 # Progress goes to stdout in the same `##dshd` protocol bin/dshd speaks, with the
 # literal nonce `pre`, because these steps happen before dshd exists to have a
-# nonce of its own.
+# nonce of its own. Every refusal is emitted as `fail <step> <reason>` on that
+# protocol, not only as prose: the app renders the reason it is given, and a
+# refusal that reached only the log pane left the screen saying "the payload did
+# not verify" for what was in fact a directory mode.
 #
 # exit: 0 ok · 2 not root · 6 the payload did not verify or could not be
-#       installed · otherwise dshd's own status
+#       installed · 7 the install directory is not safe · otherwise dshd's own
+#       status
 
 set -u
 
@@ -48,17 +61,29 @@ umask 077
 
 EXIT_NOT_ROOT=2
 EXIT_PAYLOAD=6
+EXIT_BASE=7
 
 : "${DSH_BASE:=/data/local/dsh}"
 STAGE="$DSH_BASE/.stage"
 MANIFEST="payload.sha256"
 
 FROM=""
+# The step a refusal is attributed to, so the app can say which check refused.
+CURRENT_STEP=pre
 
 # --- output -----------------------------------------------------------------
 
 boot_emit() {
   printf '##dshd pre %s\n' "$*"
+}
+
+# Announces a step and remembers its name: a later refusal is attributed to it,
+# which is the difference between a screen that says "the install directory is
+# not safe" and one that says "the payload did not verify".
+boot_step() {
+  CURRENT_STEP=$1
+  shift
+  boot_emit "step $CURRENT_STEP $*"
 }
 
 boot_say() {
@@ -73,6 +98,7 @@ boot_die() {
   rc=$1
   shift
   boot_fail "$*"
+  boot_emit "fail $CURRENT_STEP $(printf '%s' "$*" | tr '\n' ' ')"
   printf 'bootstrap: %s\n' "$*" >&2
   exit "$rc"
 }
@@ -125,30 +151,100 @@ owner_of() {
 # --- the checks -------------------------------------------------------------
 
 check_root() {
-  boot_emit "step root checking for root"
+  boot_step root "checking for root"
   uid=$(id -u 2>/dev/null)
   if [ "$uid" != 0 ]; then
-    boot_emit "fail root the shell is uid ${uid:-unknown}, not 0"
-    boot_die "$EXIT_NOT_ROOT" "not root (uid ${uid:-unknown}): the app has to be granted root in Magisk/KernelSU first"
+    boot_die "$EXIT_NOT_ROOT" "the shell is uid ${uid:-unknown}, not root: grant the app root in your root manager (Magisk, KernelSU or KernelSU-Next), then tap Set up again"
   fi
   boot_emit "ok root"
 }
 
+# Closes the group and other write bits on a directory root will run scripts
+# from, then re-reads the mode rather than trusting chmod's exit status. Sets
+# $TIGHTENED_FROM and $TIGHTENED_TO to the before and after modes, or leaves
+# $TIGHTENED_FROM empty when there was nothing to do. Returns non-zero only when
+# the directory is still writable by somebody else afterwards: continuing would
+# mean root running whatever that somebody puts there. A directory that merely
+# stayed group-readable is not a hole, and refusing over it would be the dead end
+# this function exists to remove.
+TIGHTENED_FROM=""
+TIGHTENED_TO=""
+tighten_dir() {
+  dir=$1
+  TIGHTENED_FROM=""
+  TIGHTENED_TO=""
+  mode=$(mode_of "$dir") || return 1
+  perm=$((0$mode))
+  [ $((perm & 07777)) -eq 0700 ] && return 0
+
+  chmod 700 "$dir" 2>/dev/null
+  after=$(mode_of "$dir") || return 1
+
+  # Fatal first, whatever chmod claimed: if somebody other than root can still
+  # write here, nothing below matters.
+  [ $((0$after & 022)) -eq 0 ] || return 1
+
+  if [ "$after" = "$mode" ]; then
+    # No write bits left and the chmod changed nothing — it failed, or the
+    # directory was already closed to writing. Nothing to report, no claim to make.
+    return 0
+  fi
+  TIGHTENED_FROM=$mode
+  TIGHTENED_TO=$after
+
+  if [ $((perm & 022)) -ne 0 ]; then
+    boot_warn "$dir was mode $mode: group- or other-writable, so another uid could replace the scripts root runs. It is mode $after now."
+  else
+    boot_warn "$dir was mode $mode; it is mode $after now, like the rest of the install"
+  fi
+  return 0
+}
+
 # The directory root will execute from. Owner and mode are the control: another
 # uid that can write here is another uid that chooses what root runs.
+#
+# A mode that can be fixed is fixed. Refusing it outright is what this did first,
+# and on a first run the directory it refused had just been created by the app's
+# own `mkdir -p` under the su shell's umask — so the app was handed a setup that
+# could not proceed and a screen that blamed the payload, on a device whose owner
+# has no terminal by design.
 check_base() {
-  [ -e "$DSH_BASE" ] || return 0
-  [ -d "$DSH_BASE" ] || boot_die "$EXIT_PAYLOAD" "$DSH_BASE exists and is not a directory"
+  boot_step base "checking $DSH_BASE"
 
-  base_mode=$(mode_of "$DSH_BASE") || boot_die "$EXIT_PAYLOAD" "cannot read the mode of $DSH_BASE (no usable stat)"
-  base_owner=$(owner_of "$DSH_BASE") || boot_die "$EXIT_PAYLOAD" "cannot read the owner of $DSH_BASE (no usable stat)"
-  base_perm=$((0$base_mode))
+  # Not followed: `[ -d ]` and stat(1) both follow symlinks, so everything below
+  # would be describing the target and not the path root is handed.
+  if [ -L "$DSH_BASE" ]; then
+    boot_die "$EXIT_BASE" "$DSH_BASE is a symlink: root runs scripts from this path, and it has to be a real directory root owns, not a link to one. Remove the link as root, then tap Set up again"
+  fi
+
+  if [ ! -e "$DSH_BASE" ]; then
+    # -m 700 as well as the umask: this directory decides what root executes, and
+    # its mode is not something to leave to whoever happened to call us. The
+    # plain mkdir is the fallback for a mkdir without -m.
+    mkdir -m 700 "$DSH_BASE" 2>/dev/null || mkdir "$DSH_BASE" 2>/dev/null ||
+      boot_die "$EXIT_BASE" "cannot create $DSH_BASE"
+    chmod 700 "$DSH_BASE" 2>/dev/null
+    boot_emit "ok base created $DSH_BASE, mode $(mode_of "$DSH_BASE" 2>/dev/null)"
+    return 0
+  fi
+
+  [ -d "$DSH_BASE" ] || boot_die "$EXIT_BASE" "$DSH_BASE exists and is not a directory"
+
+  base_mode=$(mode_of "$DSH_BASE") || boot_die "$EXIT_BASE" "cannot read the mode of $DSH_BASE (no usable stat)"
+  base_owner=$(owner_of "$DSH_BASE") || boot_die "$EXIT_BASE" "cannot read the owner of $DSH_BASE (no usable stat)"
 
   if [ "$base_owner" != "$(id -u)" ]; then
-    boot_die "$EXIT_PAYLOAD" "$DSH_BASE is owned by uid $base_owner, not root: whoever owns it decides which scripts root runs, so this refuses to install into it"
+    boot_die "$EXIT_BASE" "$DSH_BASE is owned by uid $base_owner, not root: whoever owns it decides which scripts root runs, so this refuses to install into it. Remove it as root (a file manager running as root, or a recovery shell), then tap Set up again"
   fi
-  if [ $((base_perm & 022)) -ne 0 ]; then
-    boot_die "$EXIT_PAYLOAD" "$DSH_BASE is mode $base_mode: group or other writable, so another uid could replace the scripts root runs"
+
+  if ! tighten_dir "$DSH_BASE"; then
+    boot_die "$EXIT_BASE" "$DSH_BASE is mode $base_mode and the group or other write bits could not be closed on it: another uid could replace the scripts root runs. Remove it as root, then tap Set up again"
+  fi
+
+  if [ -n "$TIGHTENED_FROM" ]; then
+    boot_emit "ok base $DSH_BASE was mode $TIGHTENED_FROM, now $TIGHTENED_TO"
+  else
+    boot_emit "ok base $DSH_BASE mode $base_mode, owner root"
   fi
   return 0
 }
@@ -212,7 +308,14 @@ install_payload() {
     src="$STAGE/$path"
     dst="$DSH_BASE/$path"
     dir=$(dirname "$dst")
+    # A symlinked install directory is not one we made, and it decides where root
+    # writes. Refused rather than followed.
+    if [ -L "$dir" ]; then
+      boot_die "$EXIT_BASE" "the install directory $dir is a symlink: root would be writing wherever it points, so this refuses to install through it. Remove it as root, then tap Set up again"
+    fi
     mkdir -p "$dir" || boot_die "$EXIT_PAYLOAD" "cannot create $dir"
+    tighten_dir "$dir" ||
+      boot_die "$EXIT_BASE" "the install directory $dir is writable by group or other and that could not be closed: another uid could replace what root runs. Remove it as root, then tap Set up again"
     if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
       KEPT=$((KEPT + 1))
     else
@@ -256,7 +359,7 @@ boot_main() {
   check_root
   check_base
 
-  boot_emit "step payload installing the app's payload"
+  boot_step payload "installing the app's payload"
   extract_payload
   verify_payload
   install_payload

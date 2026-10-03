@@ -94,7 +94,7 @@ Everything in this table exists and is exercised by `tests/run.sh`.
 | `tools/confinement-check.sh` | 3 | Phase 3, decided rather than assumed: runs the harness's *own* `landlock-run --probe`, then proves a denied write with a two-sided control, then writes the pin and the sentence the app shows. |
 | `android/build.sh` | 5 | Builds the APK with the SDK's own tools — aapt2, javac, d8, zipalign, apksigner — and refuses to report a build that does not verify. No Gradle, no AndroidX, no dependency resolution. |
 | `android/src/dev/dshd/app/` | 5 | The app: `MainActivity` (setup screen, then the WebView), `SetupService` (foreground for the length of a run), `Shell` (the one `su` command and the payload pipe), `RunState` (worker thread → UI, coalesced), `Protocol` (the `##dshd` parser — the one part a host can decide). |
-| `android/payload/bootstrap.sh` | 5 | The first thing of ours that runs on a device: refuses a non-root shell or an install directory another uid could write, verifies every file by digest, installs by rename, then execs `dshd`. |
+| `android/payload/bootstrap.sh` | 5 | The first thing of ours that runs on a device: refuses a non-root shell (exit 2), makes the install directory safe (0700, or exit 7 with the reason), verifies every file by digest, installs by rename into directories nobody else can write, then execs `dshd`. |
 | `tools/mkpayload.sh` | 5 | Builds `android/assets/payload.tar` and `payload.id` from the working tree, reproducibly, and refuses to write an archive whose members are not exactly the manifested files. |
 | `boot/service.d/dshd.sh` | 4 | Opt-in boot autostart, installed at `/data/adb/service.d` — the path all three root solutions run. |
 | `docs/security.md` | §7 | The exposure, the two controls, and the on-device procedure that proves a second app is blocked. |
@@ -200,7 +200,9 @@ the payload the app ships, and that every verb it can send is one `dshd`
 dispatches — both derived from the two sides rather than listed; that the
 bootstrap installs nothing when a file does not match the manifest, when the
 transfer is truncated, when it cannot compute a digest at all, or when the
-install directory is writable by another uid; and that `Protocol.java`, which is
+install directory cannot be made safe (exit 7: another uid's directory, a symlink,
+or a mode that stays open — while a root-owned mode it *can* close is closed and
+reported rather than refused); and that `Protocol.java`, which is
 plain Java on purpose, renders the real `dshd`'s output correctly, including
 refusing a run that says `done ok` and then exits non-zero.
 
@@ -297,6 +299,27 @@ that a device would have blamed on Android:
   "applying firewall rule (app uid: 10123)" while the script received nothing, which
   is how a §7 control ends up installed against the wrong UID or not at all. The
   values are exported now, and a test asserts what the script is handed.
+- **The app refused the install directory it had just created.** Found on a real
+  device, which is the point of this entry: setup stopped, the screen said *the
+  payload did not verify*, and the log said `/data/local/dsh is mode 0775: group
+  or other writable`. Both halves were wrong, in different ways. The directory was
+  0775 because the app's command created it with `mkdir -p` under whatever umask
+  the `su` shell was started with — the mode check was correct and the *creation*
+  was the bug. And "the payload did not verify" was the app's summary for exit 6,
+  a code the bootstrap used for every refusal it could make, consulted *before* it
+  looked at whether the script had named the check that refused (it had not: the
+  bootstrap printed its refusals to the log and not on the protocol). So: the app
+  now creates the directory with `(umask 077; mkdir -p "$S")`, the bootstrap closes
+  a root-owned mode it can close and reports the before and after instead of
+  refusing, `chmod`'s exit status is not trusted (the mode is read back, and a
+  directory still writable by somebody else is fatal), a symlinked install
+  directory is refused rather than followed, a refusal carries its own exit code
+  (7, "the install directory is not safe", with 6 left meaning the payload did not
+  verify and nothing else), every refusal is emitted as `fail <step> <reason>` on
+  the protocol, and the app renders a named check before it renders a code. The
+  mode cases in `tests/payload.test.sh` use the real filesystem with only `id` and
+  the owner stubbed — a stubbed `stat` would have agreed with whatever the script
+  believed, which is exactly how this reached a phone.
 
 ## Corrections to the plan found while implementing
 

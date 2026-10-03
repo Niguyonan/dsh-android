@@ -291,11 +291,31 @@ compare-then-rename, never write-in-place, because `bin/dshd` may be the running
 supervisor and a shell reads its own script incrementally.
 
 **What the bootstrap refuses.** A shell that is not uid 0 (exit 2, so the app can
-tell "no root granted" from everything else with one number). An install
-directory owned by another uid, or writable by group or other — whoever can write
-there decides which scripts root runs next. A payload file whose digest does not
-match. A device with no `sha256sum`, `shasum`, `openssl` or BusyBox: it refuses
-to install unverified files rather than install them unchecked.
+tell "no root granted" from everything else with one number). A payload file
+whose digest does not match. A device with no `sha256sum`, `shasum`, `openssl` or
+BusyBox: it refuses to install unverified files rather than install them
+unchecked.
+
+**The install directory, and what it does when the mode is wrong.** `/data/local/dsh`
+is where root-executed scripts live, so a directory another uid can write to is a
+directory that chooses what root runs next. The first version of this refused any
+such directory outright, and that was a defect of a specific kind: the app's own
+command created it with `mkdir -p` under whatever umask the `su` shell happened
+to have, so on a real device the setup refused the directory it had created one
+line earlier, and the screen — which only had the exit code to go on — blamed the
+payload. Three things changed. The app creates it under `umask 077`
+(`(umask 077; mkdir -p "$S")` in `Shell.bootstrapCommand`), so a first run gets
+0700 whatever the shell carried. A root-owned directory that is not 0700 is
+closed to 0700, with the mode read back afterwards rather than assumed — `chmod`'s
+exit status is not consulted, and a directory that is still writable by somebody
+else afterwards is fatal (exit 7). And every refusal now emits `fail <step>
+<reason>` on the protocol, so the app renders the check that refused instead of a
+summary of a number: exit 6 is "the payload did not verify" and nothing else.
+
+What it still will not fix, and refuses instead: a directory owned by another uid,
+a symlink in place of the install directory or of one of the directories inside it
+that scripts are installed into, and a mode that stays open. Those need a root
+shell, and the refusal says so in as many words.
 
 **What the WebView is allowed to do.** It renders the harness UI, which is agent
 output. So: no `addJavascriptInterface` (a bridge would connect agent output to a

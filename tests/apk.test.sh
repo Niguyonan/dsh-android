@@ -154,9 +154,47 @@ EOF
   contains "a failed step is named" "setup failed at firewall: exit 5" "$out"
   check "and that step is marked failed" "1" "$(printf '%s\n' "$out" | grep -c 'firewall state=3')"
 
-  # Not root, told apart from everything else by the exit code alone.
-  out=$(parse --exit 2 <"$TMP/fail.txt")
-  contains "exit 2 reads as a root problem" "root was not granted" "$out"
+  # Not root, told apart from everything else. The bytes are the real bootstrap's,
+  # refused at its first check: this is the end-to-end proof that a refusal
+  # reaches the screen with the words the script wrote, and not with a summary
+  # derived from the exit code.
+  sh "$REPO/tools/mkpayload.sh" --out "$TMP/proto" --quiet || fail "cannot build a payload to refuse"
+  mkdir -p "$TMP/bin-nonroot"
+  printf '#!/bin/sh\necho 2000\n' >"$TMP/bin-nonroot/id"
+  chmod 755 "$TMP/bin-nonroot/id"
+  cat "$TMP/proto/payload.tar" | PATH="$TMP/bin-nonroot:$PATH" DSH_BASE="$TMP/boot-base" \
+    sh "$REPO/android/payload/bootstrap.sh" setup --app-uid 10123 \
+    >"$TMP/boot-nonroot.txt" 2>&1
+  boot_rc=$?
+  check "the real bootstrap refuses a non-root shell with exit 2" "2" "$boot_rc"
+  out=$(parse --exit 2 <"$TMP/boot-nonroot.txt")
+  contains "and the screen names the check that refused" "setup failed at root" "$out"
+  contains "with the sentence the script wrote, not a summary" "not root" "$out"
+  check "and the refusal created nothing" "no" \
+    "$([ -e "$TMP/boot-base" ] && echo yes || echo no)"
+
+  # The order of that judgement is a fix, not a preference: exit 6 used to answer
+  # first, and it covers every refusal the bootstrap can make, so a root-owned
+  # directory left group-writable by a previous run reached the screen as a
+  # corrupt payload. A named check outranks the code.
+  printf '##dshd pre step base checking /data/local/dsh\n##dshd pre fail base /data/local/dsh is mode 0775 and the group or other write bits could not be closed on it\n' \
+    >"$TMP/base.txt"
+  out=$(parse --exit 7 <"$TMP/base.txt")
+  contains "a named check outranks the exit-code summary" "setup failed at base" "$out"
+  contains "and the reason is the script's own sentence" "could not be closed" "$out"
+  lacks "not the payload story the exit code would have told" "did not verify" "$out"
+
+  # The codes are still the fallback when nothing named a step: an older payload
+  # on the device, or a stream cut off before a refusal finished its sentence.
+  printf '##dshd 42 step payload installing the app payload\n' >"$TMP/bare.txt"
+  out=$(parse --exit 6 <"$TMP/bare.txt")
+  contains "exit 6 with no named step still reads as a payload problem" \
+    "the payload did not verify" "$out"
+  out=$(parse --exit 7 <"$TMP/bare.txt")
+  contains "exit 7 with no named step reads as an install directory problem" \
+    "the install directory is not safe" "$out"
+  out=$(parse --exit 2 <"$TMP/bare.txt")
+  contains "exit 2 with no named step reads as a root problem" "root was not granted" "$out"
 
   # A stream that stops without a done event.
   printf '##dshd 42 step probe checking\n' >"$TMP/short.txt"
@@ -200,6 +238,14 @@ contains "file access is off" "setAllowFileAccess(false)" "$sources"
 contains "content access is off" "setAllowContentAccess(false)" "$sources"
 contains "mixed content is refused" "MIXED_CONTENT_NEVER_ALLOW" "$sources"
 contains "the WebView is created without a view id" "No view id on purpose" "$sources"
+
+# The one command the app sends to root, and the mode it creates the install
+# directory with. That directory is where root runs scripts from, and leaving its
+# mode to the umask of whatever `su` shell the device happens to start is how a
+# first run got a 0775 base that the bootstrap then refused. The check is on the
+# source because the command is built in Java that needs Android to run.
+contains "the app creates the install directory closed to everyone else" \
+  "(umask 077; mkdir -p" "$(grep -o 'b.append("S=").*' "$SHELL_JAVA")"
 
 # The two Java-8 APIs that exist on Android only from API 26, which this app does
 # not require. Both were hit while writing it; both are silent NoSuchMethodError
@@ -294,6 +340,17 @@ else
       fail "the APK carries exactly the payload in the working tree" \
         "built $(wc -c <"$TMP/assets/payload.tar" | tr -d ' ') bytes, in the APK $(wc -c <"$TMP/from-apk.tar" | tr -d ' ') bytes: $(cmp -l "$TMP/assets/payload.tar" "$TMP/from-apk.tar" 2>&1 | head -2 | tr '\n' ' ')"
     fi
+
+    # And the command the app will send to su is in the dex it ships, not only in
+    # the source: the mode the install directory is created with is the difference
+    # between a first run that works and one that refuses its own directory.
+    # grep -a, because a dex is binary and grep would otherwise say "Binary file
+    # matches" and count nothing.
+    unzip -p "$APK" classes.dex >"$TMP/classes.dex" 2>/dev/null
+    check "the shipped dex creates the staging directory under umask 077" "1" \
+      "$(grep -ac -- '(umask 077; mkdir -p "$S")' "$TMP/classes.dex")"
+    check "and still streams the payload into tar" "1" \
+      "$(grep -ac -- ' && tar -xf - -C "$S"' "$TMP/classes.dex")"
     unzip -p "$APK" assets/payload.id >"$TMP/from-apk.id" 2>/dev/null
     check "and the payload id the app compares against" "$(cat "$TMP/assets/payload.id")" "$(cat "$TMP/from-apk.id")"
 

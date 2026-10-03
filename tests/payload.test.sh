@@ -10,8 +10,13 @@
 #     install directory (../, /etc)
 #   * the bootstrap verifies every file by digest *before* installing any of it,
 #     and refuses to install anything at all when it cannot verify
-#   * it refuses a install directory that another uid could write to, because
-#     that uid would then decide what root runs next
+#   * it makes the install directory safe: a root-owned one whose mode is not
+#     0700 is fixed, because on a first run the app's own mkdir created it under
+#     the su shell's umask and refusing it meant refusing ourselves. What it
+#     cannot fix — another uid's directory, a symlink, a chmod that did not take
+#     — ends in exit 7 with nothing installed, and with `fail base` on the
+#     protocol so the app can say which check refused instead of blaming the
+#     payload
 #   * a truncated transfer and a tampered file both end in exit 6 with nothing
 #     installed, rather than a half-installed tree that mostly works
 #   * the payload id is content-addressed: same tree, same id; changed byte,
@@ -19,7 +24,9 @@
 #
 # The device is stubbed, not simulated: `id` and `stat` are shell scripts in a
 # directory put first on PATH, so `uid 0` and `mode 700` can be arranged on a
-# development host that is neither.
+# development host that is neither. The mode cases stub `id` alone and use the
+# real filesystem: the failure that reached a phone was a real directory with a
+# real mode, and a stubbed stat agrees with whatever the script believes.
 set -u
 
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -129,6 +136,40 @@ run_bootstrap_file() {
   tarfile=$2
   shift 2
   cat "$tarfile" | PATH="$TMP/bin:$PATH" DSH_BASE="$base" sh "$BOOT" "$@" 2>&1
+}
+
+# Only the two identities a development host cannot arrange are faked: `id -u`
+# reports 0, and stat's owner reports 0. Everything else is real — stat's *mode*,
+# chmod, the filesystem — so the mode arithmetic and the read-back after chmod are
+# the real thing. That is deliberate: the failure that reached a phone was a real
+# directory with a real mode, and a stubbed mode agrees with whatever the script
+# believes.
+REAL_STAT=$(command -v stat)
+case "$REAL_STAT" in /*) ;; *) REAL_STAT=/usr/bin/stat ;; esac
+
+write_root_stub() {
+  mkdir -p "$1"
+  printf '#!/bin/sh\ncase "$1" in -u) echo 0 ;; *) exit 1 ;; esac\n' >"$1/id"
+  {
+    printf '#!/bin/sh\n'
+    printf 'case "$1 $2" in\n'
+    printf '  "-c %%u") echo 0 ;;\n'
+    printf '  *) exec %s "$@" ;;\n' "$REAL_STAT"
+    printf 'esac\n'
+  } >"$1/stat"
+  chmod 755 "$1/id" "$1/stat"
+}
+
+stub_root_owner() { write_root_stub "$TMP/bin-root"; }
+
+run_bootstrap_real() {
+  base=$1
+  shift
+  cat "$ASSETS/payload.tar" | PATH="$TMP/bin-root:$PATH" DSH_BASE="$base" sh "$BOOT" "$@" 2>&1
+}
+
+host_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 
 # `version` is the verb that exercises the whole bootstrap and stops at the hand
@@ -307,21 +348,108 @@ check "and installs nothing" "no" "$([ -e "$BASE4/bin" ] && echo yes || echo no)
 
 printf '\n== bootstrap checks the install directory ==\n'
 
+# A stub that keeps reporting 777 whatever chmod does, so the read-back after
+# chmod is what decides. Fail closed: a directory another uid can write is a
+# directory that chooses what root runs next.
 stub_platform 0 777 0
 BASE5="$TMP/base-world"
 mkdir -p "$BASE5"
 out=$(run_bootstrap "$BASE5" "$HANDOFF")
 rc=$?
-check "a world-writable base exits 6" "6" "$rc"
-contains "and names the reason" "group or other writable" "$out"
+check "a mode that will not close exits 7" "7" "$rc"
+contains "and says the write bits could not be closed" "could not be closed" "$out"
+contains "and the app is told which check refused" "##dshd pre fail base" "$out"
+check "and installs nothing" "no" "$([ -e "$BASE5/bin" ] && echo yes || echo no)"
 
 stub_platform 0 700 501
 BASE6="$TMP/base-other-owner"
 mkdir -p "$BASE6"
 out=$(run_bootstrap "$BASE6" "$HANDOFF")
 rc=$?
-check "a base owned by another uid exits 6" "6" "$rc"
-contains "and names the reason" "not root" "$out"
+check "a base owned by another uid exits 7" "7" "$rc"
+contains "and names the owner" "owned by uid 501, not root" "$out"
+check "and installs nothing" "no" "$([ -e "$BASE6/bin" ] && echo yes || echo no)"
+
+# --- bootstrap: a real directory with a real mode ---------------------------
+#
+# The stub above arranges a mode string; these use the filesystem, because the
+# failure that reached a phone was a real 0775 directory created by the app's own
+# `mkdir -p` under the umask the su shell happened to have. Refusing it was
+# refusing a directory the app itself had just made, and what the person holding
+# the phone saw was "the payload did not verify".
+
+printf '\n== bootstrap fixes a directory it can fix ==\n'
+
+stub_root_owner
+
+REAL1="$TMP/real-775"
+( umask 002; mkdir -p "$REAL1" )
+out=$(run_bootstrap_real "$REAL1" "$HANDOFF")
+rc=$?
+check "a real 0775 base is fixed rather than refused" "0" "$rc"
+fixed_mode=$(host_mode "$REAL1")
+check "and ends up 0700" "700" "$fixed_mode"
+check "and nobody else can write to it" "0" "$((0$fixed_mode & 022))"
+contains "it says what the mode was" "was mode 775" "$out"
+contains "and what it is now" "now 700" "$out"
+contains "and the base step reports ok" "##dshd pre ok base" "$out"
+check "and the payload is installed anyway" "yes" \
+  "$([ -x "$REAL1/bin/dshd" ] && echo yes || echo no)"
+
+REAL0="$TMP/real-755"
+( umask 022; mkdir -p "$REAL0" )
+out=$(run_bootstrap_real "$REAL0" "$HANDOFF")
+rc=$?
+check "a 0755 base is tightened to 0700 too" "0" "$rc"
+check "and ends up 0700" "700" "$(host_mode "$REAL0")"
+lacks "and is not described as writable by others, because it was not" \
+  "group- or other-writable" "$out"
+
+REALN="$TMP/real-new"
+out=$(run_bootstrap_real "$REALN" "$HANDOFF")
+rc=$?
+check "a base that does not exist is created" "0" "$rc"
+check "and created 0700" "700" "$(host_mode "$REALN")"
+contains "and it says so" "created $REALN, mode 700" "$out"
+
+printf '\n== bootstrap refuses what it cannot fix ==\n'
+
+# A base that is a symlink: every check below it would describe the target, and
+# stat(1) would follow the link rather than look at the path root is handed.
+REALT="$TMP/real-target"
+mkdir -p "$REALT"
+LINK="$TMP/base-link"
+ln -s "$REALT" "$LINK"
+out=$(run_bootstrap_real "$LINK" "$HANDOFF")
+rc=$?
+check "a symlinked base exits 7" "7" "$rc"
+contains "and says it is a link" "is a symlink" "$out"
+check "and installs nothing behind it" "no" "$([ -e "$REALT/bin" ] && echo yes || echo no)"
+
+# An install directory that is a symlink: root would write wherever it points.
+REALS="$TMP/real-symlink"
+mkdir -p "$REALS/bin-target"
+ln -s "$REALS/bin-target" "$REALS/bin"
+out=$(run_bootstrap_real "$REALS" "$HANDOFF")
+rc=$?
+check "a symlinked install directory exits 7" "7" "$rc"
+contains "and says why it will not follow it" "refuses to install through it" "$out"
+check "and writes nothing through it" "no" \
+  "$([ -e "$REALS/bin-target/dshd" ] && echo yes || echo no)"
+
+# chmod that does not close the bits, on a directory that needs it. The mode is
+# read back rather than trusted, so this is caught.
+REAL4="$TMP/real-nofix"
+( umask 002; mkdir -p "$REAL4" )
+write_root_stub "$TMP/bin-nochmod"
+printf '#!/bin/sh\nexit 1\n' >"$TMP/bin-nochmod/chmod"
+chmod 755 "$TMP/bin-nochmod/chmod"
+out=$(cat "$ASSETS/payload.tar" | PATH="$TMP/bin-nochmod:$PATH" DSH_BASE="$REAL4" \
+  sh "$BOOT" "$HANDOFF" 2>&1)
+rc=$?
+check "a chmod that closes nothing exits 7" "7" "$rc"
+check "and the directory is still 0775" "775" "$(host_mode "$REAL4")"
+check "and installs nothing" "no" "$([ -e "$REAL4/bin" ] && echo yes || echo no)"
 
 # --- bootstrap: not root ----------------------------------------------------
 
@@ -341,7 +469,8 @@ rc=$?
 check "bootstrap --help exits 0" "0" "$rc"
 contains "and explains the by-hand path" "--from DIR" "$out"
 
-out=$(PATH="$TMP/bin:$PATH" sh "$BOOT" --from "$TMP/nothing-here" "$HANDOFF" 2>&1)
+out=$(PATH="$TMP/bin:$PATH" DSH_BASE="$TMP/base-from-empty" sh "$BOOT" \
+  --from "$TMP/nothing-here" "$HANDOFF" 2>&1)
 rc=$?
 check "a --from directory without a manifest exits 6" "6" "$rc"
 
