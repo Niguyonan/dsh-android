@@ -1,8 +1,8 @@
 #!/bin/sh
 # Host-side test entry point for dsh-android.
 #
-# Five suites, all runnable on any machine with `sh` (the guard suite also needs
-# Node):
+# Six suites, all runnable on any machine with `sh` (the guard suite and the
+# Phase 2 smoke test also need Node):
 #
 #   * guard/test/guard.test.mjs — the §7 guard: token auth, Host/Origin policy,
 #     loopback-bind enforcement, HTTP/SSE/WebSocket proxying, and the teardown
@@ -18,6 +18,10 @@
 #   * tests/rootfs-setup.test.sh — tools/rootfs-setup.sh, with local tarballs
 #     instead of downloads: extraction, checksums, the refusal to clobber, and
 #     the paths that only break on a re-run.
+#   * tests/install-harness.test.sh — tools/install-harness.sh, with the registry
+#     and the chroot stubbed: the version pin, --ignore-scripts, the manifest,
+#     and the Phase 2 contract asserted against a stand-in harness that can be
+#     told to satisfy it, ignore it, or bind the wrong interface.
 #
 # None of them can prove anything kernel-level: mounts, devpts, chroot,
 # Landlock and SELinux are Phase 0 probes on the device. See PORTING-PLAN.md §5.
@@ -44,6 +48,9 @@ sh tests/probe.test.sh || failed=1
 
 printf '\n== Phase 1 rootfs ==\n'
 sh tests/rootfs-setup.test.sh || failed=1
+
+printf '\n== Phase 2 harness install ==\n'
+sh tests/install-harness.test.sh || failed=1
 
 printf '\n== dshd lifecycle ==\n'
 sh tests/dshd.test.sh || failed=1

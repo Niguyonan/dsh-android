@@ -65,21 +65,23 @@ Everything in this table exists and is exercised by `tests/run.sh`.
 | `guard/test/guard.test.mjs` | §7 | Proves the guard's controls rather than asserting them: auth, Host/Origin, bind refusal, upgrade teardown. |
 | `tools/probe.sh` | 0 | Phase 0 device probes → the P0 ledger, with verdicts for D3, D6 and §7, and the root-solution block. |
 | `tools/rootfs-setup.sh` | 1 | Fetch + checksum-verify the glibc arm64 base and glibc Node, build the skeleton, write DNS, then run Gate P1 in a chroot. |
+| `tools/install-harness.sh` | 2 | Install the pinned harness with `--ignore-scripts`, then *prove* the contract everything downstream depends on: loopback-only bind, 401 without a session, the launch-token line `dshd` parses, and the cross-origin fence. |
 | `tools/firewall.sh` | §7 | The reachability half of the mitigation: a UID-owner rule set that keeps every other app off both ports, self-verified after apply. |
 | `boot/service.d/dshd.sh` | 4 | Opt-in boot autostart, installed at `/data/adb/service.d` — the path all three root solutions run. |
 | `docs/security.md` | §7 | The exposure, the two controls, and the on-device procedure that proves a second app is blocked. |
 | `docs/root-solutions.md` | — | Magisk vs KernelSU vs KernelSU-Next: detection, `su`, SELinux domains, boot scripts, mount namespaces. |
 | `docs/phase-0-probe-ledger.md` | 0 | The P0 template to fill in on the device, including the root-solution rows. |
-| `tests/run.sh` | — | Host-side entry point: the guard suite, the firewall suite, then `dshd`'s lifecycle suite. |
+| `tests/run.sh` | — | Host-side entry point: the guard, firewall, probe, rootfs and harness-install suites, then `dshd`'s lifecycle suite. |
 | `tests/dshd.test.sh` | — | `dshd`'s lifecycle without a device or root: exit codes, posture, rotation, firewall handover, supervisor pair semantics. |
 | `tests/firewall.test.sh` | §7 | The rule set against a fake iptables: apply, verify, tamper detection, removal, idempotence. |
 | `tests/probe.test.sh` | 0 | `probe.sh`'s contract and verdicts with the device stubbed: it must fail loudly on a host, never quietly. |
 | `tests/rootfs-setup.test.sh` | 1 | `rootfs-setup.sh` with local tarballs instead of downloads: extraction, checksums, refusal to clobber, re-run paths. |
+| `tests/install-harness.test.sh` | 2 | `install-harness.sh` with the registry and chroot stubbed, including the negative controls: an open harness and a wild bind must both fail the smoke test. |
 
 **Not written yet** — named so that the quick start below reads as a plan rather
-than a description: `tools/install-harness.sh` (2), `tools/confinement-check.sh`
-(3), `android/` (5), `tools/backup.sh`, `tools/update.sh`, `tools/rollback.sh`,
-`tools/doctor.sh` (6) and `docs/runbook.md`.
+than a description: `tools/confinement-check.sh` (3), `android/` (5),
+`tools/backup.sh`, `tools/update.sh`, `tools/rollback.sh`, `tools/doctor.sh` (6)
+and `docs/runbook.md`.
 
 ## Quick start
 
