@@ -324,18 +324,25 @@ that a device would have blamed on Android:
   because "the two builds agree" is also what a wrong-but-consistent mtime looks
   like.
 - **What the archive bytes still depend on, measured rather than assumed.** The
-  same tree built by macOS `tar` and by GNU `tar` produces different *bytes*:
-  bsdtar terminates a numeric header field with a space where GNU tar zero-pads
-  and terminates with NUL (`000755 \0` against `0000755\0`), and the mode, uid,
-  gid, size and mtime fields are all encoded that way. No content difference. So
-  the archive is a function of the tree and of the `tar` that built it, while
-  `payload.id` — and every per-file digest the bootstrap verifies before
-  installing anything — is a function of the tree alone. That is why the released
-  artifact is checked by id and by per-file digest against a build of the same
-  commit, and why "the APK carries exactly the payload in the working tree" is a
-  claim the suite can only make about one host. Writing ustar headers by hand
-  would close it, and is not worth doing in the one script whose output decides
-  what root installs.
+  same tree built by macOS `tar` and by GNU `tar` produces different *bytes*, in
+  three ways: bsdtar terminates a numeric header field with a space where GNU tar
+  zero-pads and terminates with NUL (`000755 \0` against `0000755\0`, and the
+  mode, uid, gid, size and mtime fields are all encoded that way); directory
+  members come out in the filesystem's readdir order, which no argument to this
+  script controls, and the two archives listed the five `tools/` members in
+  different orders; and GNU tar pads to its 20-record blocking factor, so the same
+  content weighed 215040 bytes against 213504. `tools/mkpayload.sh`'s header used
+  to promise that "two builds of the same tree produce the same bytes" while
+  another paragraph of the same header warned about member order, and the
+  measurement settled it. What *is* host-independent is `payload.id` and the
+  manifest body it hashes — whose order is the list in `tools/mkpayload.sh`, a
+  literal, and not the filesystem's — along with every per-file digest the
+  bootstrap verifies before installing anything. So the released artifact is
+  checked by id and by per-file digest against a build of the same commit, and
+  "the APK carries exactly the payload in the working tree" is a claim the suite
+  can only make about one host. Making the bytes identical everywhere means
+  writing ustar headers here by hand, which is not worth doing in the one script
+  whose output decides what root installs.
 
 ## Corrections to the plan found while implementing
 
