@@ -67,7 +67,9 @@ Two things the diagram is load-bearing for, both from §7 of the plan:
 | `magisk/service.d/dshd.sh` | 4 | Optional boot-time autostart (opt-in; the APK owns lifecycle by default). |
 | `android/` | 5 | The WebView APK: viewer plus lifecycle owner, no harness logic. |
 | `docs/` | — | Probe ledger template, security design + proof procedure, runbook. |
-| `tests/` | — | Host-side tests for `dshd` and the guard. |
+| `tests/run.sh` | — | Host-side entry point: the guard suite, then `dshd`'s lifecycle suite. |
+| `tests/dshd.test.sh` | — | `dshd`'s lifecycle without a device or root: exit codes, posture, rotation, supervisor pair semantics. |
+| `guard/test/guard.test.mjs` | §7 | Proves the guard's controls rather than asserting them: auth, Host/Origin, bind refusal, upgrade teardown. |
 
 ## Quick start
 
@@ -96,9 +98,13 @@ This repository is a macOS-development-host implementation of a device-targeted 
 Being explicit about the split is part of the design (§10 of the plan).
 
 **Verified on this host:** the guard's authentication, Host/Origin, loopback-bind and
-proxying behaviour, including WebSocket upgrades; `dshd`'s lifecycle logic
-(idempotent start, stale-PID cleanup, backoff, log rotation, status) driven through
-its dry-run path; shell syntax of every script.
+proxying behaviour, including WebSocket upgrades and the teardown of upgraded sockets;
+`dshd`'s lifecycle logic (idempotent start, stale-PID cleanup, posture resolution,
+token handling, log rotation, exit codes) driven through its dry-run path; and the
+supervisor's pair semantics driven end-to-end against the *real* guard with a stand-in
+harness — kill either child and the other is torn down and the pair restarts, with the
+pid file proven (via `lsof`) to name the process that holds the port. `tests/run.sh`
+runs both suites.
 
 **Untestable off-device, and therefore still open:** every kernel-level question —
 Landlock availability, unprivileged user namespaces, `noexec` on `/data`, SELinux
@@ -106,6 +112,30 @@ policy for `mount` from a `su` context, `xt_owner` for the firewall rule, and wh
 `node-pty` allocates a PTY under the Android kernel in a chroot. Those need
 `tools/probe.sh` on the actual hardware and are tracked in
 [`docs/phase-0-probe-ledger.md`](./docs/phase-0-probe-ledger.md).
+
+## Defects the host tests caught (and what they cost on a device)
+
+Recorded because each one failed *silently* in production shape — the class of bug
+that a device would have blamed on Android:
+
+- **Upgraded sockets leaked.** Node detaches a socket handed to an `upgrade` listener
+  from the server's connection tracking, so `closeAllConnections()` skips it and
+  `server.close()` waits on it forever. Every WebView reload left its harness
+  connection open for the life of the process, and `SIGTERM` was answered only by
+  `dshd`'s `SIGKILL`. The guard now tracks its pairs and tears down both ends.
+- **The guard could exit 0 without listening.** The `argv[1] === import.meta.url`
+  check did not resolve symlinks, so under any symlinked path (`/tmp` on macOS, a
+  symlinked install dir) `main()` never ran: no log line, no port, and a supervisor
+  restarting it forever. Both sides are realpath'd now, with a test that executes the
+  guard through a symlink.
+- **`$!` was a wrapper subshell, not the child.** Backgrounding a shell *function*
+  makes `$!` the subshell; the harness is a grandchild that survives SIGTERM to it.
+  `dshd stop` would report success while the harness kept holding its port. Children
+  are now spawned as single external commands, and `lsof` in the suite holds the pid
+  file to that claim.
+- **The root refusal exited 1, not the documented 2.** The APK's health check
+  distinguishes "not root" from every other failure, so the contract is now what the
+  header says.
 
 ## Corrections to the plan found while implementing
 
