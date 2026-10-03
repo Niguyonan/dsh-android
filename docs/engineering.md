@@ -293,6 +293,31 @@ that a device would have blamed on Android:
   alternation in basic regexes, so every one of those assertions was vacuous on
   the machine it was written on. It is `awk` now. A green check that cannot fail
   is the same failure this repository keeps recording, one level up.
+- **The fixed mtime was only fixed in one timezone, and `touch -t` reads local
+  time.** Found by comparing the payload inside the *released* 0.1.1 APK — built on
+  a UTC runner — against a build of the same commit on this machine: the first
+  difference was at byte 104, the mtime field of the first header. `payload.id` is
+  a hash of the manifest body and not of the tar bytes, so it matched; the
+  reproducibility check in the suite builds twice on one host, where the timezone
+  cancels out, so it matched as well. The touch pass is `TZ=UTC0 touch -t
+  200001010000` now, and the suite checks both directions: two builds under
+  `TZ=UTC-14` and `TZ=UTC+12` must be byte-identical, and the mtime field of the
+  first header must read `07033241600` (2000-01-01T00:00:00Z) — stated as bytes,
+  because "the two builds agree" is also what a wrong-but-consistent mtime looks
+  like.
+- **What the archive bytes still depend on, measured rather than assumed.** The
+  same tree built by macOS `tar` and by GNU `tar` produces different *bytes*:
+  bsdtar terminates a numeric header field with a space where GNU tar zero-pads
+  and terminates with NUL (`000755 \0` against `0000755\0`), and the mode, uid,
+  gid, size and mtime fields are all encoded that way. No content difference. So
+  the archive is a function of the tree and of the `tar` that built it, while
+  `payload.id` — and every per-file digest
+  the bootstrap verifies before installing anything — is a function of the tree
+  alone. That is why the released artifact is checked by id and by per-file digest
+  against a build of the same commit, and why "the APK carries exactly the payload
+  in the working tree" is a claim the suite can only make about one host. Writing
+  ustar headers by hand would close it, and is not worth doing in the one script
+  whose output decides what root installs.
 - **The firewall script got none of its inputs.** `dshd` read `DSH_APP_UID` and the
   ports from its own environment or a sourced `dshd.conf` and then ran
   `firewall.sh` as a separate process without exporting any of them: the log said

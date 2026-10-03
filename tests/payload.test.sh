@@ -262,6 +262,30 @@ else
     "$(cmp -l "$TMP/first.tar" "$ASSETS/payload.tar" 2>&1 | head -2 | tr '\n' ' ')"
 fi
 
+# The same tree, built somewhere else in the world. `touch -t` reads its argument
+# as *local* time, so the fixed mtime was only fixed within one timezone: the
+# released 0.1.1 APK, built on a UTC runner, differed from the build of the same
+# commit on this machine at byte 104 -- the first header's mtime field -- while
+# `payload.id`, which is over the manifest body and not over the tar bytes,
+# matched. Two zones that are nowhere near each other, so the check cannot pass
+# because the host happens to agree with itself.
+TZ=UTC-14 sh "$MK" --out "$TMP/tz-a" --quiet
+TZ=UTC+12 sh "$MK" --out "$TMP/tz-b" --quiet
+if cmp -s "$TMP/tz-a/payload.tar" "$TMP/tz-b/payload.tar"; then
+  pass "the archive does not depend on the builder's timezone"
+else
+  fail "the archive does not depend on the builder's timezone" \
+    "$(cmp -l "$TMP/tz-a/payload.tar" "$TMP/tz-b/payload.tar" 2>&1 | head -2 | tr '\n' ' ')"
+fi
+check "and neither does the id" "$(cat "$TMP/tz-a/payload.id")" "$(cat "$TMP/tz-b/payload.id")"
+
+# And the value itself, read out of the first header: 2000-01-01T00:00:00Z in
+# octal, which is what `TZ=UTC0 touch -t 200001010000` produces. Stated as bytes
+# rather than as "the two builds agree", because two builds agreeing is also what
+# a wrong-but-consistent mtime looks like.
+check "the first member's mtime is the UTC epoch, not the builder's" "07033241600" \
+  "$(dd if="$ASSETS/payload.tar" bs=1 skip=136 count=11 2>/dev/null)"
+
 BACKUP="$TMP/bootstrap.sh.orig"
 cp "$REPO/android/payload/bootstrap.sh" "$BACKUP"
 printf '\n# a byte that was not there before\n' >>"$REPO/android/payload/bootstrap.sh"
