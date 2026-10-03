@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DeepSeek Harness</string>
+
+    <string name="channel_name">Setup</string>
+    <string name="channel_description">Progress while the harness is installed or started</string>
+    <string name="notif_working">Working…</string>
+
+    <string name="status_working">Working</string>
+    <string name="status_running">Running</string>
+    <string name="status_stopped">Stopped</string>
+    <string name="status_not_set_up">Not set up</string>
+
+    <string name="show_log">Log</string>
+    <string name="hide_log">Hide log</string>
+    <string name="log_label">Output from the device (newest last)</string>
+    <string name="action_stop">Stop</string>
+    <string name="action_rerun">Re-run setup</string>
+    <string name="action_set_up">Set up</string>
+    <string name="action_start">Start</string>
+    <string name="action_open">Open</string>
+    <string name="autostart_on">Start at boot: on</string>
+    <string name="autostart_off">Start at boot: off</string>
+
+    <string name="welcome_title">Set up DeepSeek Harness</string>
+    <string name="welcome_body">This app runs the DeepSeek Harness on your device, and shows it in a window. Nothing is installed until you tap Continue and then Set up.\n\nIt needs root. The harness runs inside a small Linux system that only root can create, and the agent it starts runs commands as root. Your root manager (Magisk, KernelSU or KernelSU-Next) will ask you once; after that, each action is a single short command, and this app never keeps a root shell open.\n\nThe first set-up downloads about 1 GB and takes a while. Keep the app in the background if you like — the download continues, with a notification.</string>
+    <string name="continue_label">Continue</string>
+
+    <string name="setup_title">Ready to set up</string>
+    <string name="setup_body">This will check the device, download a small Linux system, install the harness, lock the ports to this app, and start the server. You can watch each step below.</string>
+    <string name="setup_running_title">Setting up</string>
+    <string name="setup_running_body">Leave it alone and it will finish. Tap Log to watch.</string>
+    <string name="setup_failed_title">Setup stopped</string>
+    <string name="setup_failed_body">Something went wrong. Tap Log to see the last lines, then try again.</string>
+    <string name="setup_start_title">Set up</string>
+    <string name="setup_start_body">The harness is installed but not running.</string>
+    <string name="setup_done_title">Running</string>
+    <string name="setup_done_body">Tap Open to use it.</string>
+
+    <string name="warn_confinement_unknown">The agent\'s sandbox has not been checked on this device yet. Until it is, treat the agent as having full access to the Linux system it runs in.</string>
+    <string name="warn_confinement">Sandbox not proven: %1$s. The agent may read and write files outside its workspace.</string>
+    <string name="warn_payload_stale">This app ships a newer runtime than the one installed on the device. Tap Re-run setup to update it.</string>
+
+    <string name="step_root">Checking for root</string>
+    <string name="step_payload">Installing the app\'s runtime</string>
+    <string name="step_probe">Checking what this device can do</string>
+    <string name="step_rootfs">Installing the Linux system</string>
+    <string name="step_harness">Installing the harness</string>
+    <string name="step_confinement">Checking the sandbox</string>
+    <string name="step_firewall">Locking the ports to this app</string>
+    <string name="step_config">Saving settings</string>
+    <string name="step_boot">Setting up start at boot</string>
+    <string name="step_start">Starting the server</string>
+
+    <string name="error_bad_url">The server gave an address this app cannot use.</string>
+    <string name="error_no_browser">No browser to open that link in.</string>
+    <string name="error_blocked_navigation">That kind of link is blocked.</string>
+</resources>
