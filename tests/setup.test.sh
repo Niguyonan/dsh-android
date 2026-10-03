@@ -236,7 +236,10 @@ contains "it pins the uid" "DSH_APP_UID=10123" "$conf"
 contains "it leaves the firewall on" "DSH_FIREWALL=on" "$conf"
 contains "it records the ports" "DSH_GUARD_PORT=3081" "$conf"
 contains "autostart is off unless asked for" "autostart=off" "$conf"
-conf_mode=$(stat -f '%Lp' "$BASE/etc/dshd.conf" 2>/dev/null || stat -c '%a' "$BASE/etc/dshd.conf")
+# GNU stat first: on Linux `stat -f` means "filesystem", succeeds, and prints
+# its format string, so the BSD spelling has to come second or this reads
+# nonsense and never falls back.
+conf_mode=$(stat -c '%a' "$BASE/etc/dshd.conf" 2>/dev/null || stat -f '%Lp' "$BASE/etc/dshd.conf")
 check "it is not world readable" "600" "$conf_mode"
 
 out=$(DSH_BASE="$BASE" DSHD_DRY_RUN=1 sh "$BASE/bin/dshd" setup --check)

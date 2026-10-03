@@ -51,6 +51,9 @@ cd "$REPO" || exit 1
 
 failed=0
 
+printf '== documentation claims ==\n'
+sh tests/docs.test.sh || failed=1
+
 printf '== guard (§7) ==\n'
 if command -v node >/dev/null 2>&1; then
   node --test "guard/test/*.test.mjs" || failed=1

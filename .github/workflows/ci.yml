@@ -1,0 +1,36 @@
+name: ci
+
+# The host-side suites, on every push and pull request.
+#
+# They run on Linux here and were written on macOS, which is the point: the
+# suites stub the platform (a fake `su`, a fake `iptables`, an `id` that reports
+# root) and are supposed to be portable, so a runner is the cheapest way to find
+# out where that is not true. Tags are excluded because the release workflow
+# builds from them and does its own verification.
+
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['v*']
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Toolchain
+        run: |
+          set -eu
+          echo "node: $(node --version)"
+          echo "java: $(java -version 2>&1 | head -n 1)"
+          echo "sdk:  ${ANDROID_HOME:-unset}"
+
+      - name: Host-side suites
+        run: sh tests/run.sh

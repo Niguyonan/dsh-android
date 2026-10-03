@@ -13,7 +13,7 @@
 #   * every `tools/*.sh` the docs name exists, except the Phase 6 tools the docs
 #     name *as* not written
 #   * every `dshd <verb>` the docs name is a verb dshd actually dispatches
-#   * every path in the README's layout table exists
+#   * every path in the layout table in docs/engineering.md exists
 #   * every test suite in tests/ is invoked by tests/run.sh, and everything
 #     run.sh invokes exists
 #   * the suite count in the README matches the suites that run
@@ -27,7 +27,11 @@ REPO=$(cd "$SELF_DIR/.." && pwd)
 cd "$REPO" || exit 1
 
 DOCS="README.md docs/runbook.md docs/security.md docs/root-solutions.md \
-docs/phase-0-probe-ledger.md"
+docs/phase-0-probe-ledger.md docs/engineering.md android/keystore/README.md"
+
+# The layout table lives with the implementation notes rather than the product
+# README: it is a table of source paths, and the README is about the app.
+LAYOUT_TABLE="docs/engineering.md"
 
 # Tools the docs deliberately name as not written yet. Anything else that is
 # named has to exist: a runbook that tells someone to run a script that is not
@@ -99,8 +103,10 @@ printf '\n== every verb the docs name is a verb dshd dispatches ==\n'
 
 # `dshd stop` and `dshd setup|start|stop|restart|…` are both documentation; the
 # second one is how the README's diagram lists the verbs it supports.
-verbs=$(grep -ho 'dshd[[:space:]][a-z][a-z|-]*' $DOCS | sed 's/^dshd[[:space:]]*//' |
-  tr '|' '\n' | grep . | sort -u)
+# Not preceded by `=` or a letter: `CN=dshd release` in a keytool invocation is
+# not a command, and neither is `mydshd stop`.
+verbs=$(grep -hoE '(^|[^=[:alnum:]])`?dshd[[:space:]]+[a-z][a-z|-]*' $DOCS |
+  sed -e 's/.*dshd[[:space:]]*//' | tr '|' '\n' | grep . | LC_ALL=C sort -u)
 unknown=""
 for v in $verbs; do
   grep -qE "^ *$v\) " bin/dshd || unknown="$unknown $v"
@@ -120,9 +126,9 @@ check "every user-facing verb is documented somewhere" "" "$undocumented"
 
 # --- the layout table -------------------------------------------------------
 
-printf '\n== the README layout table is true ==\n'
+printf '\n== the layout table is true ==\n'
 
-table=$(sed -n '/^| Path | Phase | What it is |/,/^$/p' README.md)
+table=$(sed -n '/^| Path | Phase | What it is |/,/^$/p' $LAYOUT_TABLE)
 count=$(printf '%s\n' "$table" | grep -c '^| `')
 case "$count" in
   0) fail "the layout table was found" "no rows matched" ;;
@@ -147,7 +153,12 @@ check "every path in the layout table exists" "" "$gone"
 printf '\n== the suites that run are the suites that exist ==\n'
 
 declared=$(ls tests/*.test.sh | LC_ALL=C sort | tr '\n' ' ')
-invoked=$(grep -o 'tests/[a-z-]*\.test\.sh' tests/run.sh | LC_ALL=C sort -u | tr '\n' ' ')
+# Only *commands* count. The first version of this matched any mention, so the
+# suite index in run.sh's own header comment was enough to register a suite that
+# nothing ran -- and it reported ok while tests/docs.test.sh itself was invoked
+# by nothing at all.
+invoked=$(grep -oE '^[[:space:]]*sh tests/[a-z-]*\.test\.sh' tests/run.sh |
+  grep -o 'tests/[a-z-]*\.test\.sh' | LC_ALL=C sort -u | tr '\n' ' ')
 check "every suite in tests/ is invoked by tests/run.sh" "$declared" "$invoked"
 
 sh_suites=$(printf '%s\n' "$invoked" | tr ' ' '\n' | grep -c .)
@@ -159,11 +170,11 @@ esac
 
 words="one two three four five six seven eight nine ten eleven twelve"
 word=$(printf '%s\n' $words | sed -n "${total}p")
-if grep -q "$word suites" README.md; then
-  pass "the README's suite count ($word) matches the $total that run"
+if grep -q "$word suites" $DOCS; then
+  pass "the documented suite count ($word) matches the $total that run"
 else
-  fail "the README's suite count matches the $total that run" \
-    "expected the phrase '$word suites' in README.md"
+  fail "the documented suite count matches the $total that run" \
+    "expected the phrase '$word suites' in the documentation"
 fi
 
 printf '\n%d checks, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"

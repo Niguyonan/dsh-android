@@ -23,9 +23,16 @@
 #
 # usage: build.sh [--sdk DIR] [--out FILE] [--ks FILE] [--ks-pass PASS]
 #                 [--alias NAME] [--version-name V] [--version-code N]
-#                 [--no-payload] [--debug-keystore]
+#                 [--no-payload]
 #
 # env: ANDROID_HOME or ANDROID_SDK_ROOT, unless --sdk is given.
+#      DSH_KS_FILE, DSH_KS_PASS, DSH_KS_ALIAS — the same three settings as the
+#      flags, because a password on a command line is a password in `ps`. CI
+#      passes them this way, from repository secrets.
+#
+# Signing: with no keystore given, one is generated in the build directory and
+# the APK is debug-signed — installable, and not distributable. The last line of
+# the output always says which of the two happened.
 #
 # exit: 0 ok · 1 usage or no SDK · 2 the payload could not be built · 3 a build
 #       step failed · 4 the APK did not verify
@@ -48,9 +55,10 @@ VERSION_NAME=0.1.0
 VERSION_CODE=1
 OUT=""
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-KEYSTORE=""
-KS_PASS="android"
-KS_ALIAS="dshd"
+KEYSTORE="${DSH_KS_FILE:-}"
+KS_PASS="${DSH_KS_PASS:-android}"
+KS_ALIAS="${DSH_KS_ALIAS:-dshd}"
+DEBUG_SIGNED=0
 WITH_PAYLOAD=1
 
 die() {
@@ -186,6 +194,7 @@ zip -q -j unsigned.apk dex/classes.dex || die 3 "cannot add classes.dex"
 "$BT/zipalign" -f 4 unsigned.apk aligned.apk || die 3 "zipalign failed"
 
 if [ -z "$KEYSTORE" ]; then
+  DEBUG_SIGNED=1
   KEYSTORE="$BUILD/debug.keystore"
   if [ ! -f "$KEYSTORE" ]; then
     say "signing:  generating a debug keystore at $KEYSTORE"
@@ -207,6 +216,12 @@ mkdir -p "$(dirname "$OUT")" || die 3 "cannot create $(dirname "$OUT")"
 
 # --- report -----------------------------------------------------------------
 
+if [ "$DEBUG_SIGNED" = 1 ]; then
+  say "signing:  DEBUG key (generated) — installable, and not for distribution."
+  say "          For a release, set DSH_KS_FILE/DSH_KS_PASS/DSH_KS_ALIAS (or --ks)."
+else
+  say "signing:  $KEYSTORE (alias $KS_ALIAS)"
+fi
 say "apk:      $OUT ($(wc -c <"$OUT" | tr -d ' ') bytes)"
 say "package:  $PKG $VERSION_NAME ($VERSION_CODE)"
 say "sha256:   $(shasum -a 256 "$OUT" 2>/dev/null | cut -d' ' -f1 || sha256sum "$OUT" | cut -d' ' -f1)"
