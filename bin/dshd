@@ -28,6 +28,15 @@
 
 set -u
 
+# Everything dshd creates is secret-bearing: $DSH_LOG/harness.log holds the
+# harness's launch token (it prints its own authenticated URL), $DSH_STATE holds
+# the guard token and the harness's signing key, and /data/local is traversable
+# by other apps on Android. A default umask of 022 would make those files
+# world-readable, which hands the whole §7 control to any co-resident app that
+# can guess a path — the token in the log is as good as the session it mints.
+# Set before the first mkdir, and inherited by every child that creates a file.
+umask 077
+
 DSHD_VERSION=1
 # Where the supervisor re-executes itself from. Defaults to $0 (the on-device
 # case); tests/run.sh points it at a shim, because this file's shebang is
@@ -61,6 +70,7 @@ DSHD_VERSION=1
 : "${DSH_POLL_INTERVAL:=2}"         # supervisor child-liveness poll (seconds)
 : "${DSH_START_TIMEOUT:=90}"        # readiness wait after start (seconds)
 : "${DSH_STOP_TIMEOUT:=15}"         # grace before SIGKILL (seconds)
+: "${DSH_LAUNCH_TIMEOUT:=30}"       # wait for the harness's printed launch token
 : "${DSH_BACKOFF_MIN:=1}"
 : "${DSH_BACKOFF_MAX:=60}"
 : "${DSH_BACKOFF_RESET:=300}"       # uptime that forgives the backoff ladder
@@ -111,7 +121,9 @@ run_show() {
   "$@"
 }
 
-# Translate an in-rootfs absolute path to a host path when chroot is disabled.
+# The path to *hand a child*, given an in-rootfs absolute path. With a real
+# chroot the child sees it as written; in dev mode the rootfs directory stands
+# in for /.
 in_rootfs_path() {
   if [ "$DSHD_NO_CHROOT" = 1 ]; then
     printf '%s%s\n' "$DSH_ROOTFS" "$1"
@@ -119,6 +131,15 @@ in_rootfs_path() {
     printf '%s\n' "$1"
   fi
 }
+
+# The path for *dshd itself to look at*, given an in-rootfs absolute path.
+# These are not interchangeable, and mixing them up is invisible in dev mode
+# because in_rootfs_path() happens to prefix the rootfs there too: inside a real
+# chroot an in-rootfs path is not host-readable, so a host-side -f/-x test must
+# always prefix. Both spellings below were wrong in one mode or the other, and
+# the wrong one on a device is fatal — start_guard() told the guard to read a
+# token at /data/local/dsh/state/... inside a tree where that cannot exist.
+host_path() { printf '%s%s\n' "$DSH_ROOTFS" "$1"; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
@@ -261,6 +282,18 @@ confinement_status() {
 
 token_path() { printf '%s\n' "$DSH_STATE/guard.token"; }
 
+# The same file as the *child* must name it. Inside the chroot the bind mount
+# puts $DSH_STATE at $DSH_STATE_IN, so handing the guard the host path would
+# point it at /data/local/dsh/state/... inside a tree where that directory does
+# not exist. The host tests could not see this: with DSHD_NO_CHROOT=1,
+# in_rootfs_path() *prefixes* the rootfs, so both spellings resolve through the
+# dev-mode symlink. On a device the difference is the whole control — a guard
+# that cannot read its token exits, and the supervisor restarts the pair
+# forever. tests/dshd.test.sh now runs a chroot-argv case for this.
+guard_token_path_in() { printf '%s\n' "$DSH_STATE_IN/guard.token"; }
+harness_token_path() { printf '%s\n' "$DSH_STATE/harness.token"; }
+harness_token_path_in() { printf '%s\n' "$DSH_STATE_IN/harness.token"; }
+
 ensure_token() {
   token_file=$(token_path)
   if [ -s "$token_file" ]; then
@@ -286,6 +319,60 @@ cmd_token() {
   token_file=$(token_path)
   [ -f "$token_file" ] || die "no token yet — start the supervisor first"
   cat "$token_file"
+}
+
+# The URL to open, token included. This is what the APK asks for over `su` so
+# the token never has to be readable by the app's uid — every file above is
+# 0600 root, and the app has no business reading the harness's signing key.
+cmd_url() {
+  guard_token_file=$(token_path)
+  launch_file=$(harness_token_path)
+  case "${1:-}" in
+    --harness)
+      [ -s "$launch_file" ] || die "no harness launch token yet — start the supervisor first"
+      printf 'http://127.0.0.1:%s/?token=%s\n' "$DSH_HARNESS_PORT" "$(cat "$launch_file")"
+      ;;
+    '')
+      if [ -s "$guard_token_file" ]; then
+        printf 'http://127.0.0.1:%s/?token=%s\n' "$DSH_GUARD_PORT" "$(cat "$guard_token_file")"
+      elif [ -s "$launch_file" ]; then
+        printf 'http://127.0.0.1:%s/?token=%s\n' "$DSH_HARNESS_PORT" "$(cat "$launch_file")"
+      else
+        die "no token yet — start the supervisor first"
+      fi
+      ;;
+    *) die "unknown argument '$1' to url (try --harness)" ;;
+  esac
+}
+
+# The harness authenticates its own UI (measured on @deepseek-ai/dsh 0.2.0-rc.2):
+# it prints `dsh web: http://127.0.0.1:<port>/?token=<43-char base64url>` and
+# answers 401 to everything else until that token mints a signed cookie. The
+# guard has to replay that exchange, so dshd has to capture the token — the log
+# line is the only place the process publishes it.
+#
+# This is a version-pinned contract, which is why it fails closed and loudly
+# rather than degrading: a guard that authenticates clients while the harness
+# behind it answers 401 is the worst available shape, because everything looks
+# healthy and the UI is unreachable. tools/install-harness.sh asserts the same
+# contract at install time, so a version bump that changes it is caught before
+# anyone depends on it.
+capture_launch_token() {
+  log_file=$DSH_LOG/harness.log
+  waited=0
+  while [ "$waited" -lt "$DSH_LAUNCH_TIMEOUT" ]; do
+    if [ -f "$log_file" ]; then
+      line=$(sed -n 's|.*http://127\.0\.0\.1:[0-9][0-9]*/?token=\([A-Za-z0-9_-][A-Za-z0-9_-]*\).*|\1|p' "$log_file" | tail -n 1)
+      if [ -n "$line" ]; then
+        (umask 077; printf '%s\n' "$line" >"$(harness_token_path)") || die "cannot write $(harness_token_path)"
+        printf '%s\n' "$line"
+        return 0
+      fi
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -593,19 +680,27 @@ start_harness() {
 # The §7 guard: token auth + Host/Origin allowlist in front of the harness.
 start_guard() {
   node=$(node_bin)
-  token_file=$(in_rootfs_path "$(token_path)")
+  token_file=$(in_rootfs_path "$(guard_token_path_in)")
   log "starting guard: $DSH_GUARD_SCRIPT on 127.0.0.1:$DSH_GUARD_PORT -> 127.0.0.1:$DSH_HARNESS_PORT"
   if [ "$DSHD_DRY_RUN" = 1 ]; then
     log "dry-run: guard not started"
     return 0
   fi
-  if [ ! -f "$(in_rootfs_path "$DSH_GUARD_SCRIPT")" ]; then
-    die "guard script missing at $(in_rootfs_path "$DSH_GUARD_SCRIPT") — run tools/rootfs-setup.sh"
+  if [ ! -f "$(host_path "$DSH_GUARD_SCRIPT")" ]; then
+    die "guard script missing at $(host_path "$DSH_GUARD_SCRIPT") — run tools/rootfs-setup.sh"
   fi
+  # Fail closed: without the harness's own token the guard cannot open a session
+  # behind its login, so starting it would swap one broken front door for
+  # another. See capture_launch_token().
+  if ! launch_token=$(capture_launch_token); then
+    die "the harness printed no launch token within ${DSH_LAUNCH_TIMEOUT}s (looked for 'http://127.0.0.1:<port>/?token=...' in $DSH_LOG/harness.log) — refusing to start a guard that cannot authenticate to the harness. If the harness version changed this URL shape, that is the contract to fix; see tools/install-harness.sh."
+  fi
+  upstream_token_file=$(in_rootfs_path "$(harness_token_path_in)")
   spawn_in_rootfs "$DSH_LOG/guard.log" "$node" "$(in_rootfs_path "$DSH_GUARD_SCRIPT")" \
     --listen "127.0.0.1:$DSH_GUARD_PORT" \
     --upstream "127.0.0.1:$DSH_HARNESS_PORT" \
-    --token-file "$token_file"
+    --token-file "$token_file" \
+    --upstream-token-file "$upstream_token_file"
   guard_pid=$spawned_pid
   printf '%s\n' "$guard_pid" >"$DSH_RUN/guard.pid"
   log "guard pid $guard_pid"
@@ -899,7 +994,7 @@ cmd_status() {
     printf '\n'
   fi
 
-  if [ -x "$(in_rootfs_path "$DSH_ROOTFS$DSH_HARNESS_BIN")" ] || [ "$DSHD_NO_CHROOT" = 1 ]; then
+  if [ -x "$(host_path "$DSH_HARNESS_BIN")" ] || [ "$DSHD_NO_CHROOT" = 1 ]; then
     version=$(
       exec_in_rootfs "$DSH_HARNESS_BIN" --version 2>/dev/null | head -n 1
     ) || version=""
@@ -949,6 +1044,10 @@ usage: dshd <command> [args]
   root               which root solution granted this shell, and which su the
                      APK should use (Magisk, KernelSU, KernelSU-Next)
   token              print the guard token (§7); the APK fetches this via su
+  url [--harness]    the URL to open, token included — the guard's front door by
+                     default, or the harness port directly with --harness. This
+                     is how the APK gets in without any token being readable by
+                     the app's uid (everything is 0600 root).
   logs [-f]          last lines of dshd/harness/guard logs, or follow
   mounts             ensure the chroot bind mounts exist
   umount             tear down the chroot bind mounts
@@ -992,6 +1091,7 @@ main() {
     status) cmd_status ;;
     root) cmd_root ;;
     token) cmd_token ;;
+    url) cmd_url "${1:-}" ;;
     logs) cmd_logs "$@" ;;
     mounts) cmd_mounts ;;
     umount) require_root; umount_mounts ;;

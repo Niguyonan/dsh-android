@@ -140,6 +140,7 @@ env_new() {
   DSH_POLL_INTERVAL=0.2
   DSH_START_TIMEOUT=30
   DSH_STOP_TIMEOUT=5
+  DSH_LAUNCH_TIMEOUT=10
   DSH_BACKOFF_MIN=0
   DSH_BACKOFF_MAX=0
   DSH_LOG_MAX_BYTES=1000
@@ -148,7 +149,7 @@ env_new() {
   export DSH_BASE DSH_ROOTFS DSH_STATE DSH_WORKSPACE DSH_ETC DSH_LOG DSH_RUN \
     DSH_HARNESS_PORT DSH_GUARD_PORT DSHD_NO_CHROOT DSHD_DRY_RUN \
     DSH_POLL_INTERVAL DSH_START_TIMEOUT DSH_STOP_TIMEOUT DSH_BACKOFF_MIN \
-    DSH_BACKOFF_MAX DSH_LOG_MAX_BYTES DSH_LOG_KEEP
+    DSH_BACKOFF_MAX DSH_LOG_MAX_BYTES DSH_LOG_KEEP DSH_LAUNCH_TIMEOUT
 
   # A fake /data/adb, so root detection is hermetic: a host that happens to have
   # Magisk or KernelSU installed must not change what these tests measure.
@@ -403,6 +404,11 @@ make_rootfs_shims() {
   cat >"$DSH_ROOTFS/opt/harness-standin.js" <<'EOS'
 const net = require('node:net')
 const port = Number(process.argv[2] || 3080)
+// The launch-token line, because it is the contract dshd depends on: the real
+// harness prints exactly this to stdout, and dshd refuses to start a guard
+// without it. A stand-in that stayed silent would test a system that cannot
+// exist on a device.
+const LAUNCH_TOKEN = 'standin_launch_token_0123456789abcdefghijkl'
 // Behave like a server, not like a script: a killed peer is not a crash.
 const server = net.createServer((socket) => {
   socket.on('error', () => {})
@@ -412,7 +418,9 @@ server.on('error', (err) => {
   console.error(`stand-in harness: ${err.message}`)
   process.exit(1)
 })
-server.listen(port, '127.0.0.1')
+server.listen(port, '127.0.0.1', () => {
+  console.log(`dsh web: http://127.0.0.1:${port}/?token=${LAUNCH_TOKEN}`)
+})
 EOS
 
   cat >"$DSH_ROOTFS/usr/local/bin/dsh" <<EOF
@@ -437,10 +445,14 @@ EOF
   chmod +x "$DSH_ROOTFS/usr/local/bin/dsh" "$DSH_ROOTFS/usr/local/bin/node"
 
   # Dev-mode path model: without a chroot, in_rootfs_path() prefixes DSH_ROOTFS,
-  # so $DSH_STATE must be reachable *under* the rootfs too. On the device the
-  # bind mount is what makes that true; here a symlink stands in for it.
-  mkdir -p "$DSH_ROOTFS$DSH_BASE"
-  ln -s "$DSH_STATE" "$DSH_ROOTFS$DSH_BASE/state"
+  # so an in-rootfs path must be reachable *under* the rootfs. On the device the
+  # bind mount is what makes that true — dshd mounts $DSH_STATE at
+  # $DSH_ROOTFS/state — so the shim is that mount point, not a copy of the host
+  # spelling. Getting this wrong is how the guard's token path stayed broken on
+  # devices while this suite passed: prefixing a *host* path happens to resolve
+  # here and cannot resolve inside a real chroot.
+  mkdir -p "$DSH_ROOTFS"
+  ln -sfn "$DSH_STATE" "$DSH_ROOTFS/state"
 }
 
 # Root-only commands, without root: `id -u` is the only check that gates them,
@@ -855,6 +867,99 @@ EOF
 }
 
 # ===========================================================================
+# 10. Device path model: what a child is told inside a real chroot
+# ===========================================================================
+#
+# Everything above runs with DSHD_NO_CHROOT=1, where in_rootfs_path() *prefixes*
+# the rootfs — so a host path handed to a child resolves here and cannot resolve
+# on a device, where the state directory is a bind mount at /state. That is
+# exactly how two fatal bugs lived in start_guard(): it pointed the guard at
+# /data/local/dsh/state/guard.token, and it checked for the guard script at
+# /opt/dsh-android/guard.mjs on the host, where neither exists inside a chroot.
+# Both would have stopped the §7 control from ever starting on hardware, with a
+# green suite. This case makes the difference observable without a device:
+# DSHD_NO_CHROOT=0 for real, with `mount` and `chroot` stubbed to record argv.
+case_chroot_argv() {
+  env_new
+  DSHD_NO_CHROOT=0
+  DSHD_DRY_RUN=0
+  export DSHD_NO_CHROOT DSHD_DRY_RUN
+  make_rootfs_shims
+  make_id_double
+  make_self_shim
+
+  # `chroot` records what it was asked to run and then stays alive, so the
+  # supervisor sees a live pair instead of restarting it under the test.
+  cat >"$TMP/bin/mount" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >>"$TMP/mount.calls"
+exit 0
+EOF
+  cat >"$TMP/bin/chroot" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >>"$TMP/chroot.calls"
+exec sleep 30
+EOF
+  chmod +x "$TMP/bin/mount" "$TMP/bin/chroot"
+
+  # The launch-token line the real harness prints. Without it the guard step is
+  # never reached: dshd waits, then refuses to start a guard it cannot
+  # authenticate — correct, but not what this case is measuring.
+  printf 'dsh web: http://127.0.0.1:%s/?token=%s\n' "$DSH_HARNESS_PORT" \
+    "seeded_launch_token_0123456789abcdefghijkl" >"$DSH_LOG/harness.log"
+
+  sh "$DSHD" supervise >/dev/null 2>&1 &
+  sup=$!
+  if wait_until 20 grep -q "guard.mjs" "$TMP/chroot.calls" 2>/dev/null; then
+    pass "the guard is started under a chroot"
+  else
+    fail "the guard is started under a chroot" \
+      "chroot was never asked to run the guard: $(cat "$TMP/chroot.calls" 2>/dev/null)"
+  fi
+  kill -TERM "$sup" 2>/dev/null
+  wait "$sup" 2>/dev/null
+
+  calls=$(cat "$TMP/chroot.calls" 2>/dev/null)
+  guard_line=$(printf '%s\n' "$calls" | grep "guard.mjs" | tail -n 1)
+  harness_line=$(printf '%s\n' "$calls" | grep -v "guard.mjs" | grep "dsh" | tail -n 1)
+
+  # The argument must be the child's view of the file...
+  contains "the guard is told to read its token at the in-rootfs path" \
+    "--token-file /state/guard.token" "$guard_line"
+  contains "and the harness token the same way" \
+    "--upstream-token-file /state/harness.token" "$guard_line"
+  # ...and not the host's view, which is what broke on devices.
+  lacks "the guard is not handed the host path to the token" \
+    "$DSH_STATE/guard.token" "$guard_line"
+  # The harness is started with an in-rootfs binary, not a host path.
+  contains "the harness runs from its in-rootfs path" "/usr/local/bin/dsh" "$harness_line"
+  lacks "the harness is not run through a host path" "$DSH_ROOTFS/usr/local/bin/dsh" "$harness_line"
+
+  # The state directory is a bind mount on a device; the same source must be
+  # mounted there, or the child's /state would be an empty directory and the
+  # token path above would be correct and still unreadable. Mounting lives in
+  # `dshd mounts` (start calls it before spawning the supervisor), so ask for it
+  # directly rather than waiting on a readiness the stubs never provide.
+  sh "$DSHD" mounts >/dev/null 2>&1
+  mounts=$(cat "$TMP/mount.calls" 2>/dev/null)
+  contains "state is bind-mounted where the child expects it" \
+    "bind $DSH_STATE $DSH_ROOTFS/state" "$mounts"
+  contains "the workspace is bind-mounted too" \
+    "bind $DSH_WORKSPACE $DSH_ROOTFS/workspace" "$mounts"
+
+  # The captured token lands on the host side, root-only.
+  if [ -s "$DSH_STATE/harness.token" ]; then
+    pass "the harness launch token is captured for the guard"
+  else
+    fail "the harness launch token is captured for the guard"
+  fi
+  check "the captured launch token is 0600" "-rw-------" \
+    "$(ls -l "$DSH_STATE/harness.token" 2>/dev/null | cut -c1-10)"
+  check "the captured token is the one the harness printed" \
+    "seeded_launch_token_0123456789abcdefghijkl" "$(cat "$DSH_STATE/harness.token" 2>/dev/null)"
+}
+
+# ===========================================================================
 
 case_syntax
 case_contract
@@ -874,6 +979,7 @@ case_firewall_missing
 case_firewall_handover
 case_real_pair
 case_orphaned_children
+case_chroot_argv
 
 printf '\n%s run, %s failed, %s skipped\n' "$TESTS_RUN" "$TESTS_FAILED" "$TESTS_SKIPPED"
 [ "$TESTS_FAILED" -eq 0 ] || exit 1

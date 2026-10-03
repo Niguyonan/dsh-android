@@ -34,6 +34,8 @@ import {
 } from '../guard.mjs'
 
 const TOKEN = 'test-token-0123456789abcdef'
+const UPSTREAM_TOKEN = 'launch-token-abcdef0123456789'
+const HARNESS_COOKIE = 'dsh-auth-test'
 
 // --- unit: bind enforcement -------------------------------------------------
 
@@ -167,10 +169,44 @@ test('upstreamHeaders keeps an upgrade intact and strips hop-by-hop otherwise', 
 // A stand-in harness: echoes the headers it received, and answers upgrades with
 // a real 101 handshake so the guard's socket splice can be exercised. Upgrade
 // sockets are tracked so a test can watch which side of a splice lets go.
-function startUpstream() {
+function startUpstream({ authToken = '' } = {}) {
   return new Promise((resolve) => {
     const sockets = new Set()
+    const paths = []
     const server = createServer((req, res) => {
+      paths.push(req.url ?? '')
+      // With authToken set the stand-in behaves like the real harness, measured
+      // against @deepseek-ai/dsh 0.2.0-rc.2: `/` answers 401 unless the request
+      // carries the launch token printed at startup (which mints a signed
+      // cookie) or that cookie already. The guard has to chain this, and a
+      // version bump could change it — so it belongs in a test.
+      if (authToken) {
+        const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+        const presented = url.searchParams.getAll('token')
+        const cookie = String(req.headers.cookie ?? '')
+        if (
+          req.method === 'GET' &&
+          url.pathname === '/' &&
+          presented.length === 1 &&
+          presented[0] === authToken
+        ) {
+          res.writeHead(303, {
+            'cache-control': 'no-store',
+            location: './',
+            'set-cookie': `${HARNESS_COOKIE}=v1.payload.signature; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict`,
+          })
+          res.end()
+          return
+        }
+        if (req.method === 'GET' && url.pathname === '/' && cookie.includes(`${HARNESS_COOKIE}=`)) {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+          res.end('<!doctype html><title>harness</title>')
+          return
+        }
+        res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('dsh web authentication required; reopen the URL printed by dsh web.\n')
+        return
+      }
       const body = JSON.stringify({ headers: req.headers, url: req.url, method: req.method })
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(body)
@@ -195,7 +231,7 @@ function startUpstream() {
       // Echo raw bytes back so the test can prove the pipe is bidirectional.
       socket.on('data', (chunk) => socket.write(chunk))
     })
-    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, sockets }))
+    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, sockets, paths }))
   })
 }
 
@@ -224,13 +260,14 @@ async function freePort() {
   })
 }
 
-async function startGuard({ token = TOKEN } = {}) {
-  const upstream = await startUpstream()
+async function startGuard({ token = TOKEN, upstreamToken = '', upstreamOptions = {} } = {}) {
+  const upstream = await startUpstream(upstreamOptions)
   const port = await freePort()
   const guard = createGuard({
     listen: `127.0.0.1:${port}`,
     upstream: `127.0.0.1:${upstream.port}`,
     token,
+    ...(upstreamToken ? { upstreamToken } : {}),
   })
   await guard.listen()
   const base = `http://127.0.0.1:${port}`
@@ -241,6 +278,7 @@ async function startGuard({ token = TOKEN } = {}) {
     base,
     upstreamPort: upstream.port,
     upstreamSockets: upstream.sockets,
+    upstreamPaths: upstream.paths,
     // Idempotent: a test may close explicitly to prove close() terminates, and
     // the t.after hook would otherwise close a second time.
     close: async () => {
@@ -475,15 +513,17 @@ test('health requires a token; login exchanges a query token for a cookie', asyn
 
   // The regression this guards: the auth gate used to run before the login
   // route, so a client with no cookie yet could never obtain one.
+  //
+  // This guard has no upstream token file, so the login is answered 502 by
+  // design: issuing a guard cookie alone would be a login that reports success
+  // while the UI behind it answers "dsh web authentication required". The
+  // two-cookie success path is covered by the bootstrap tests at the end.
   const login = await fetch(`${g.base}/__guard/login?token=${TOKEN}`, {
     headers: { host: `127.0.0.1:${g.port}` },
     redirect: 'manual',
   })
-  assert.equal(login.status, 302)
-  const cookie = login.headers.get('set-cookie')
-  assert.match(cookie, new RegExp(`^${COOKIE_NAME}=`))
-  assert.match(cookie, /HttpOnly/)
-  assert.match(cookie, /SameSite=Strict/)
+  assert.equal(login.status, 502, 'a login with no harness bootstrap available must fail closed')
+  assert.equal(login.headers.getSetCookie().length, 0, 'no cookie may be issued when the bootstrap failed')
 
   const badLogin = await fetch(`${g.base}/__guard/login?token=wrong`, {
     headers: { host: `127.0.0.1:${g.port}` },
@@ -649,4 +689,120 @@ test('the guard runs when executed through a symlinked path', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// --- chaining the harness's own auth ----------------------------------------
+
+// The harness authenticates its own UI (measured on @deepseek-ai/dsh
+// 0.2.0-rc.2): `/` is 401 until it sees `?token=<launch token>`, which mints a
+// signed cookie. A guard that only issues its own cookie therefore produces the
+// worst shape available — a healthy-looking auth layer in front of a UI that
+// answers "dsh web authentication required" to every request. These tests hold
+// both halves of that contract.
+
+test('login issues both cookies so the UI behind the guard is reachable', async (t) => {
+  const g = await startGuard({ upstreamToken: UPSTREAM_TOKEN, upstreamOptions: { authToken: UPSTREAM_TOKEN } })
+  t.after(g.close)
+
+  const login = await fetch(`${g.base}/?token=${TOKEN}`, { redirect: 'manual' })
+  assert.equal(login.status, 303)
+  const cookies = login.headers.getSetCookie()
+  assert.equal(cookies.length, 2, `expected two cookies, got ${JSON.stringify(cookies)}`)
+  assert.ok(
+    cookies.some((c) => c.startsWith(`${COOKIE_NAME}=`)),
+    'the guard session cookie is missing',
+  )
+  assert.ok(
+    cookies.some((c) => c.startsWith(`${HARNESS_COOKIE}=`)),
+    'the harness session cookie is missing, so the UI behind the guard would 401',
+  )
+
+  const guardCookie = cookies.find((c) => c.startsWith(`${COOKIE_NAME}=`)).split(';')[0]
+  const harnessCookie = cookies.find((c) => c.startsWith(`${HARNESS_COOKIE}=`)).split(';')[0]
+
+  const both = await fetch(`${g.base}/`, { headers: { cookie: `${guardCookie}; ${harnessCookie}` } })
+  assert.equal(both.status, 200, 'the index is unreachable even with both cookies')
+
+  // The two layers are independent: the guard's cookie alone must not be enough,
+  // because that would mean a bug in the guard silently became the only control.
+  const guardOnly = await fetch(`${g.base}/`, { headers: { cookie: guardCookie } })
+  assert.equal(guardOnly.status, 401, "the harness's own auth must still apply behind the guard")
+})
+
+test('an upstream that does not answer the bootstrap fails the login loudly', async (t) => {
+  // The echo stand-in answers 200 to everything, which is what a harness whose
+  // launch-token contract changed would look like from here.
+  const g = await startGuard({ upstreamToken: UPSTREAM_TOKEN })
+  t.after(g.close)
+
+  const login = await fetch(`${g.base}/?token=${TOKEN}`, { redirect: 'manual' })
+  assert.equal(login.status, 502, 'a failed bootstrap must not look like a successful login')
+  assert.equal(login.headers.getSetCookie().length, 0, 'no session cookie may be issued when the bootstrap failed')
+  assert.match(await login.text(), /bootstrap/i)
+})
+
+test('a guard with no upstream token refuses to pretend the login worked', async (t) => {
+  const g = await startGuard()
+  t.after(g.close)
+
+  const login = await fetch(`${g.base}/?token=${TOKEN}`, { redirect: 'manual' })
+  assert.equal(login.status, 502)
+  assert.equal(login.headers.getSetCookie().length, 0)
+  assert.match(await login.text(), /upstream token/)
+})
+
+test('health reports whether the harness bootstrap is configured', async (t) => {
+  const withToken = await startGuard({ upstreamToken: UPSTREAM_TOKEN, upstreamOptions: { authToken: UPSTREAM_TOKEN } })
+  t.after(withToken.close)
+  // health is behind the same token check as everything else, so this needs one.
+  const configured = await (
+    await fetch(`${withToken.base}/__guard/health`, { headers: { cookie: `${COOKIE_NAME}=${TOKEN}` } })
+  ).json()
+  assert.equal(configured.upstreamBootstrap, 'configured')
+
+  const without = await startGuard()
+  t.after(without.close)
+  const missing = await (
+    await fetch(`${without.base}/__guard/health`, { headers: { cookie: `${COOKIE_NAME}=${TOKEN}` } })
+  ).json()
+  assert.equal(missing.upstreamBootstrap, 'missing')
+})
+
+test('the guard token never reaches the upstream in a query string', async (t) => {
+  const g = await startGuard({ upstreamToken: UPSTREAM_TOKEN, upstreamOptions: { authToken: UPSTREAM_TOKEN } })
+  t.after(g.close)
+
+  await fetch(`${g.base}/?token=${TOKEN}`, { redirect: 'manual' })
+  await fetch(`${g.base}/__guard/login?token=${TOKEN}`, { redirect: 'manual' })
+
+  const leaked = g.upstreamPaths.filter((p) => p.includes(TOKEN))
+  assert.deepEqual(leaked, [], 'the guard token was forwarded upstream')
+  // ...while the bootstrap itself did happen, with the harness's own token.
+  assert.ok(
+    g.upstreamPaths.some((p) => p.includes(UPSTREAM_TOKEN)),
+    'the guard never replayed the harness bootstrap',
+  )
+})
+
+test('neither secret is written to the guard log', async (t) => {
+  const g = await startGuard({ upstreamToken: UPSTREAM_TOKEN, upstreamOptions: { authToken: UPSTREAM_TOKEN } })
+  t.after(g.close)
+
+  const written = []
+  const original = process.stdout.write.bind(process.stdout)
+  process.stdout.write = (chunk, ...rest) => {
+    written.push(String(chunk))
+    return original(chunk, ...rest)
+  }
+  try {
+    await fetch(`${g.base}/?token=${TOKEN}`, { redirect: 'manual' })
+    await fetch(`${g.base}/__guard/health`)
+  } finally {
+    process.stdout.write = original
+  }
+
+  const text = written.join('')
+  assert.ok(text.length > 0, 'the guard logged nothing, so this test proves nothing')
+  assert.ok(!text.includes(TOKEN), `the guard token was logged: ${text}`)
+  assert.ok(!text.includes(UPSTREAM_TOKEN), `the harness launch token was logged: ${text}`)
 })

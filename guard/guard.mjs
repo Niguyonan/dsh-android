@@ -185,7 +185,10 @@ export function redact(text, token) {
 }
 
 function log(config, message) {
-  process.stdout.write(`${new Date().toISOString()} guard ${redact(message, config.token)}\n`)
+  // Both secrets: the bootstrap URL carries the harness's launch token, and an
+  // upstream error message can quote the path it was requesting.
+  const redacted = redact(redact(message, config.token), config.upstreamToken)
+  process.stdout.write(`${new Date().toISOString()} guard ${redacted}\n`)
 }
 
 function sendPlain(res, status, body, extraHeaders = {}) {
@@ -247,6 +250,7 @@ export function createGuard(options) {
   const listen = parseListen(options.listen ?? DEFAULT_LISTEN)
   const upstream = parseUpstream(options.upstream ?? DEFAULT_UPSTREAM)
   const port = listen.port
+  const upstreamToken = options.upstreamToken ?? ''
   const allowedHosts = new Set(
     [
       `127.0.0.1:${port}`,
@@ -263,7 +267,18 @@ export function createGuard(options) {
       ...(options.extraOrigins ?? []),
     ].map((o) => o.toLowerCase()),
   )
-  const config = { token, listen, upstream, allowedHosts, allowedOrigins }
+  const config = { token, listen, upstream, upstreamToken, allowedHosts, allowedOrigins }
+  // Loud, because the failure it predicts is silent: with no upstream token the
+  // guard still authenticates, still logs 200s for /__guard/health, and the UI
+  // behind it still answers 401. dshd always passes one and refuses to start
+  // without it; this branch exists for standalone runs and the test suite.
+  if (!upstreamToken) {
+    log(
+      config,
+      'WARNING: no --upstream-token-file: the harness session cannot be bootstrapped, ' +
+        'so its own auth will answer 401 for the UI this guard fronts',
+    )
+  }
   const startedAt = Date.now()
   const stats = { requests: 0, rejected: 0, upgrades: 0 }
 
@@ -407,11 +422,16 @@ export function authorize(req, config, { isUpgrade }) {
   // /__guard/login is where a client that has no cookie yet exchanges a token
   // for one, so the token arrives in the query string. That is the only place a
   // query token is accepted, and it is scoped by path so a query token is not
-  // generally usable as a credential.
-  if (pathOf(req.url) === LOGIN_PATH) {
+  // generally usable as a credential. `/` accepts it too because that is the
+  // shape the harness itself prints — one URL to hand a user or a WebView,
+  // differing only in port — and the handler answers with a redirect to `./`,
+  // so the token never survives in the address bar or reaches the upstream.
+  if (pathOf(req.url) === LOGIN_PATH || pathOf(req.url) === '/') {
     const presented = queryParam(req.url, 'token')
     if (presented && safeEqual(presented, config.token)) return { ok: true, via: 'login-query' }
-    return { ok: false, status: 401, reason: 'invalid login token', via: 'none' }
+    if (pathOf(req.url) === LOGIN_PATH) {
+      return { ok: false, status: 401, reason: 'invalid login token', via: 'none' }
+    }
   }
 
   const authVerdict = checkAuth(req.headers, config.token)
@@ -420,6 +440,51 @@ export function authorize(req, config, { isUpgrade }) {
 }
 
 // Guard-owned routes. They are authorized by the caller and never proxied.
+// Replay the harness's own bootstrap: `GET /?token=<launch token>` answers 303
+// with the signed session cookie. The guard has to do this itself rather than
+// forward the browser's request, because the browser presents the *guard's*
+// token and the harness would reject that as a foreign `?token=` value.
+//
+// The upstream hop keeps Host at the upstream authority, exactly as
+// upstreamHeaders() does for proxied requests: the cookie the harness mints is
+// signed for the authority it saw, and every later guard-forwarded request
+// presents that same authority, so the two agree.
+function bootstrapUpstream(config, callback) {
+  if (!config.upstreamToken) {
+    callback(new Error('no upstream token configured (--upstream-token-file)'))
+    return
+  }
+  const authority = `${config.upstream.host}:${config.upstream.port}`
+  const req = httpRequest(
+    {
+      host: config.upstream.host,
+      port: config.upstream.port,
+      method: 'GET',
+      path: `/?token=${encodeURIComponent(config.upstreamToken)}`,
+      headers: { host: authority, accept: 'text/html' },
+    },
+    (upRes) => {
+      const status = upRes.statusCode ?? 0
+      const cookies = upRes.headers['set-cookie'] ?? []
+      upRes.resume()
+      if (status !== 303 || cookies.length === 0) {
+        callback(
+          new Error(
+            `upstream bootstrap answered ${status} with ${cookies.length} session cookie(s); ` +
+              'expected 303 and a set-cookie — the harness launch-token contract changed',
+          ),
+        )
+        return
+      }
+      callback(null, cookies)
+    },
+  )
+  req.on('error', (err) => callback(err))
+  // A hung upstream must not hold the browser's login open forever.
+  req.setTimeout(10_000, () => req.destroy(new Error('upstream bootstrap timed out after 10s')))
+  req.end()
+}
+
 function handleGuardRoute(req, res, config, stats, startedAt, via) {
   const pathname = pathOf(req.url)
 
@@ -432,6 +497,7 @@ function handleGuardRoute(req, res, config, stats, startedAt, via) {
           ok: true,
           version: GUARD_VERSION,
           upstream: `${config.upstream.host}:${config.upstream.port}`,
+          upstreamBootstrap: config.upstreamToken ? 'configured' : 'missing',
           uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
           requests: stats.requests,
           rejected: stats.rejected,
@@ -444,16 +510,39 @@ function handleGuardRoute(req, res, config, stats, startedAt, via) {
     return true
   }
 
-  // Sets the cookie from a token the app already holds, so the app never has to
-  // inject a header (EventSource cannot send custom headers) or keep a token in
-  // a URL. The token is never logged: `log()` redacts the query and this
+  // Sets the cookie from a token the client already holds, so the app never has
+  // to inject a header (EventSource cannot send custom headers) or keep a token
+  // in a URL. The token is never logged: `log()` redacts the query and this
   // handler does not echo it.
-  if (pathname === LOGIN_PATH) {
-    sendPlain(res, 302, 'redirecting\n', {
-      location: '/',
-      'set-cookie': `${COOKIE_NAME}=${config.token}; Path=/; HttpOnly; SameSite=Strict`,
+  //
+  // Two cookies come back, and both are needed. `dsh_guard` is this guard's
+  // session; the harness's own signed cookie rides along from the bootstrap
+  // above. Issuing only the first is the defect this pairing fixes: the guard
+  // would report a successful login while every page behind it answered
+  // "dsh web authentication required".
+  if (pathname === LOGIN_PATH || (pathname === '/' && via === 'login-query')) {
+    bootstrapUpstream(config, (err, cookies) => {
+      if (err) {
+        stats.rejected += 1
+        log(config, `login rejected: ${err.message}`)
+        sendPlain(
+          res,
+          502,
+          '502 the guard could not open a harness session behind this login.\n' +
+            `${err.message}\n` +
+            'The guard is running, but the harness it fronts would refuse this browser.\n',
+        )
+        return
+      }
+      sendPlain(res, 303, 'redirecting\n', {
+        location: './',
+        'set-cookie': [
+          `${COOKIE_NAME}=${config.token}; Path=/; HttpOnly; SameSite=Strict`,
+          ...cookies,
+        ],
+      })
+      log(config, `session cookie issued, harness session bootstrapped (via ${via})`)
     })
-    log(config, `session cookie issued (via ${via})`)
     return true
   }
 
@@ -480,6 +569,7 @@ export function parseArgs(argv) {
     listen: process.env.DSH_GUARD_LISTEN ?? DEFAULT_LISTEN,
     upstream: process.env.DSH_GUARD_UPSTREAM ?? DEFAULT_UPSTREAM,
     tokenFile: process.env.DSH_GUARD_TOKEN_FILE ?? '',
+    upstreamTokenFile: process.env.DSH_GUARD_UPSTREAM_TOKEN_FILE ?? '',
   }
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
@@ -492,6 +582,7 @@ export function parseArgs(argv) {
       case '--listen': opts.listen = next(); break
       case '--upstream': opts.upstream = next(); break
       case '--token-file': opts.tokenFile = next(); break
+      case '--upstream-token-file': opts.upstreamTokenFile = next(); break
       case '--help':
       case '-h':
         opts.help = true
@@ -506,14 +597,23 @@ export function parseArgs(argv) {
 const USAGE = `guard.mjs ${GUARD_VERSION} — token-auth loopback guard for dsh-android (§7)
 
 usage: guard.mjs --token-file <path> [--listen 127.0.0.1:3081] [--upstream 127.0.0.1:3080]
+                 [--upstream-token-file <path>]
 
-  --listen     loopback bind address; a non-loopback value is fatal
-  --upstream   the harness; loopback only
-  --token-file 0600 file holding the shared token (required, fails closed)
+  --listen               loopback bind address; a non-loopback value is fatal
+  --upstream             the harness; loopback only
+  --token-file           0600 file holding the shared token (required, fails closed)
+  --upstream-token-file  0600 file holding the harness's own launch token. The
+                         harness authenticates its own UI (a '?token=' URL that
+                         mints a signed cookie), so the guard must replay that
+                         bootstrap when it issues a session of its own. Without
+                         this the guard authenticates the request and the
+                         harness still answers 401 — a guard that looks healthy
+                         while the UI it fronts is unreachable.
 
 Clients authenticate with any of: Cookie ${COOKIE_NAME}=<token>,
 Authorization: Bearer <token>, or ${TOKEN_HEADER}: <token>.
-GET ${HEALTH_PATH} reports liveness; GET ${LOGIN_PATH}?token=... sets the cookie.
+GET ${HEALTH_PATH} reports liveness. GET ${LOGIN_PATH}?token=... (or /?token=...)
+sets the session cookie and bootstraps the harness session behind it.
 `
 
 async function main(argv) {
@@ -538,6 +638,11 @@ async function main(argv) {
       listen: opts.listen,
       upstream: opts.upstream,
       token: readTokenFile(opts.tokenFile),
+      // Optional here, mandatory from dshd: a standalone run without it still
+      // serves, and warns loudly that the UI behind it will 401.
+      ...(opts.upstreamTokenFile
+        ? { upstreamToken: readTokenFile(opts.upstreamTokenFile) }
+        : {}),
     })
   } catch (err) {
     process.stderr.write(`guard: ${err.message}\n`)
