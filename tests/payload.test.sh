@@ -230,6 +230,21 @@ declared=$(printf '%s\n' "$MANIFEST" | sed -n 's/^# files: //p')
 counted=$(printf '%s\n' "$MANIFEST" | grep -cE '^[0-7]{3,4} [0-9a-f]{64} ')
 check "the manifest's file count matches its lines" "$declared" "$counted"
 
+# The id is a digest of this body, so the body's order is what keeps the id still
+# while the archive's bytes move: two tar implementations write directory members
+# in the filesystem's readdir order, which is not the same order on two machines —
+# see the measurement in docs/engineering.md. The body's order is the list in
+# mkpayload.sh, a literal in the script, and it is *not* sorted: an earlier version
+# of these comments said "sorted", and writing this check is what disproved it.
+# Being about provenance, it catches an implementation that walks the filesystem
+# only on a filesystem whose readdir order differs from the list; the cross-host
+# guard is the id comparison between a local build and the one CI makes, which is
+# how all of this was found.
+manifest_lines=$(printf '%s\n' "$MANIFEST" | grep -E '^[0-7]{3,4} [0-9a-f]{64} ')
+check "the manifest's order is mkpayload.sh's list, not the filesystem's" \
+  "$(sed -n '/^MANIFEST_FILES="/,/^"$/p' "$MK" | awk 'NF==3 { print $3 }')" \
+  "$(printf '%s\n' "$manifest_lines" | awk '{ print $3 }')"
+
 # Every tool dshd drives must be in the payload, derived from dshd rather than
 # listed here: adding a step that runs a tool nobody ships is the mistake this
 # catches. One name is expected to be missing, and it is named rather than

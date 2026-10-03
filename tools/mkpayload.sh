@@ -14,14 +14,26 @@
 #                       `dshd setup --check` decide whether the device is
 #                       running the payload this APK shipped
 #
-# The whole artifact is reproducible: fixed member order, fixed modes, fixed
-# mtimes, and no build timestamp anywhere in it, so two builds of the same tree
-# produce the same bytes and a comparison can prove what a device would install.
+# The archive is reproducible on one machine: fixed modes, fixed mtimes, and no
+# build timestamp anywhere in it, so two builds of the same tree produce the same
+# bytes and a comparison can prove what a device would install.
 #
-# The id is a digest of the manifest body — mode, digest and path per file,
-# sorted — not of the tar bytes. Tar bytes carry mtimes and a member order no two
-# tar implementations agree on; the manifest is what verification actually
-# depends on, so the manifest is what gets a stable name.
+# It is *not* byte-reproducible across `tar` implementations, and the difference
+# was measured rather than assumed, by comparing the payload in the released 0.1.1
+# APK (GNU tar on a UTC runner) against a build of the same commit on macOS
+# (bsdtar): the numeric header fields are space-terminated where GNU tar zero-pads
+# and terminates with NUL, directory members come out in the filesystem's readdir
+# order rather than any order this script controls, and GNU tar pads the archive
+# to its 20-record blocking factor (215040 bytes against 213504 for the same
+# content). So: `payload.id` is the identity, not the tar bytes.
+#
+# The id is a digest of the manifest body — mode, digest and path per file, in the
+# order of the list below — not of the tar bytes. That order comes from the list,
+# which is a literal in this script, and not from the filesystem, which is what
+# makes the id survive the three differences above: readdir order is not the same
+# on two machines, and the id is what the app and the device compare. The manifest
+# is also what verification actually depends on, so the manifest is what gets a
+# stable name.
 #
 # The archive is written and then *checked*, rather than trusted: `tar` on the
 # machine that happens to run this can add members nobody asked for (macOS ships
@@ -145,7 +157,8 @@ stage_files() {
   done <"$LIST"
 }
 
-# <mode> <sha256> <path>, sorted by path, which is also the order the id covers.
+# <mode> <sha256> <path>, in the order of MANIFEST_FILES above: the order the id
+# covers, and not the filesystem's order. See the header for why that matters.
 BODY=""
 build_body() {
   BODY=""
