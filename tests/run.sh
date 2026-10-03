@@ -42,7 +42,7 @@
 #     an Android SDK, loudly.
 #
 # None of them can prove anything kernel-level: mounts, devpts, chroot,
-# Landlock and SELinux are Phase 0 probes on the device. See PORTING-PLAN.md §5.
+# Landlock and SELinux are Phase 0 probes on the device (plan §5).
 set -u
 
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)

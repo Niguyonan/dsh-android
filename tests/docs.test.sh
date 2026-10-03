@@ -124,6 +124,31 @@ for v in $(sed -n '/^  case "\$cmd" in/,/esac/p' bin/dshd |
 done
 check "every user-facing verb is documented somewhere" "" "$undocumented"
 
+# --- links ------------------------------------------------------------------
+
+printf '\n== every relative link in the docs resolves ==\n'
+
+# A deleted file leaves dead links behind and nothing else notices: the docs
+# suite checked paths in the layout table, and a link in a sentence is not in a
+# table. Links out of the tree (GitHub's own /releases path) are skipped, because
+# a checkout cannot resolve them.
+LINKLIST="$SELF_DIR/.dead-links.$$"
+: >"$LINKLIST"
+for f in $DOCS; do
+  [ -f "$f" ] || continue
+  grep -o ']([^)]*)' "$f" 2>/dev/null | sed -e 's/^](//' -e 's/)$//' | while IFS= read -r link; do
+    case "$link" in
+      http* | '#'* | mailto:* | ..*) continue ;;
+    esac
+    target=${link%%#*}
+    [ -n "$target" ] || continue
+    [ -e "$(dirname "$f")/$target" ] || printf '%s -> %s\n' "$f" "$link"
+  done >>"$LINKLIST"
+done
+dead=$(cat "$LINKLIST")
+rm -f "$LINKLIST"
+check "every relative markdown link resolves" "" "$dead"
+
 # --- the layout table -------------------------------------------------------
 
 printf '\n== the layout table is true ==\n'

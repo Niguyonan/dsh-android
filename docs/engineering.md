@@ -4,9 +4,11 @@ How this port works, what has been verified, and what has not. This is the
 implementation record — [`README.md`](../README.md) is the product: what the app
 does and how to install it.
 
-It is the implementation of [`PORTING-PLAN.md`](../PORTING-PLAN.md): run the
-upstream DeepSeek Harness (`dsh`) on a rooted `aarch64` Android device as an
-app-like experience.
+It is the implementation of a porting plan that is not part of this repository:
+run the upstream DeepSeek Harness (`dsh`) on a rooted `aarch64` Android device as
+an app-like experience. The plan's section numbers survive in this code as names
+for decisions -- "the §7 control" is the guard and the firewall rule -- because
+that is how everyone involved refers to them.
 
 **Runtime strategy (D1):** a glibc Linux rootfs inside a real `chroot`, orchestrated
 from a root shell. Upstream's stock `linux-arm64` artifacts are valid verbatim inside
