@@ -24,7 +24,7 @@
 #   escape hatches: DSHD_NO_CHROOT=1 (development) and DSHD_DRY_RUN=1 (tests).
 #
 # Exit codes: 0 ok · 1 usage/config error · 2 not root · 3 not running ·
-#             4 start timed out
+#             4 start timed out · 5 a setup step failed
 
 set -u
 
@@ -1031,6 +1031,494 @@ cmd_doctor() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# setup — the one command the APK runs (Phase 5)
+# ---------------------------------------------------------------------------
+#
+# The point of this verb is that the app never learns the phases. It streams the
+# payload in, runs one root command, and renders what comes back:
+#
+#     su -c 'sh /data/local/dsh/bin/dshd setup --app-uid <uid>'
+#
+# Progress is a line protocol on stdout, deliberately mixed with the raw output
+# of the tools, so a human running the same command in a terminal sees the run
+# the app sees:
+#
+#     ##dshd <nonce> step <name> <message>
+#     ##dshd <nonce> ok|skip|fail <name> [detail]
+#     ##dshd <nonce> note <message>
+#     ##dshd <nonce> url <url>
+#     ##dshd <nonce> done ok|fail
+#     ##dshd <nonce> info <key> <value>          (setup --check)
+#
+# <name> matches [a-z][a-z0-9_-]* so it can be a UI key with no quoting or
+# escaping anywhere in the chain; <message> is the rest of the line and may be
+# prose. The nonce identifies one run, so a stream mixed up with another run's
+# is detectable rather than silently half-rendered. The payload bootstrap emits
+# the same shape with the literal nonce `pre`, before any of this runs.
+#
+# A step's own exit status decides its report — including through `tee`, which is
+# the trap that turns a failed download into a green tick. Steps already done
+# report `skip`, not `ok`: "nothing to do" and "just did it" look identical in a
+# log and mean different things to the person watching.
+#
+# Exit codes: 0 ok · 1 usage/config · 2 not root · 3 prerequisite failed ·
+#             4 start timed out · 5 a setup step failed
+
+SETUP_LOG=""
+SETUP_NONCE=""
+SETUP_APP_UID=""
+SETUP_RECHECK=0
+SETUP_ALLOW_UNENFORCED=0
+SETUP_REPLACE_ROOTFS=0
+SETUP_BOOT=skip
+
+# Overridable because the tests are not on a device and because a module-style
+# install may want its own directory; the default is the path all three root
+# solutions run.
+: "${DSH_BOOT_SERVICE_DIR:=/data/adb/service.d}"
+BOOT_SCRIPT_DIR="$DSH_BOOT_SERVICE_DIR"
+BOOT_SCRIPT="$BOOT_SCRIPT_DIR/dshd.sh"
+
+setup_emit() {
+  printf '##dshd %s %s\n' "$SETUP_NONCE" "$*"
+}
+
+setup_nonce() {
+  printf '%s-%s\n' "$(date '+%s')" "$$"
+}
+
+# The payload's identity, as written by tools/mkpayload.sh. Deliberately not
+# recomputed here: the build-time digest is what the app compares against its own
+# asset, and hashing the tree at runtime would answer a different question.
+setup_payload_digest() {
+  [ -f "$DSH_BASE/payload.sha256" ] || return 0
+  sed -n 's/^# payload-id:[[:space:]]*//p' "$DSH_BASE/payload.sha256" 2>/dev/null | head -n 1
+}
+
+# Run one step's command, journalling everything it prints, and return its real
+# status. `cmd | tee` reports tee's status, so the status is written to a file by
+# the command itself, inside the pipeline, where nothing can rename it.
+setup_command() {
+  setup_journal=$1
+  shift
+  if command_exists tee; then
+    cmd_rc_file="$DSH_RUN/setup.rc"
+    rm -f "$cmd_rc_file"
+    { "$@" 2>&1; printf '%s\n' "$?" >"$cmd_rc_file"; } | tee -a "$setup_journal"
+    cmd_rc=$(cat "$cmd_rc_file" 2>/dev/null)
+    rm -f "$cmd_rc_file"
+    # No status at all means the command's shell died before it could report:
+    # fail closed rather than assume success.
+    [ -n "$cmd_rc" ] || return 1
+    return "$cmd_rc"
+  fi
+  # Without tee the app still sees everything live; the journal just misses it,
+  # which is worth saying out loud rather than discovering later.
+  setup_emit "note tee is not available; this run is not journalled to $setup_journal"
+  "$@" 2>&1
+}
+
+# One step in the sequence: run it, and on failure close the protocol out with
+# `done fail` before returning, so the app never has to infer the end of a run
+# from the process's exit status alone.
+setup_seq() {
+  setup_step "$1" "$2" "$3"
+  setup_seq_rc=$?
+  if [ "$setup_seq_rc" != 0 ]; then
+    # One exit code for "a step failed" (5), with the step's own status and name
+    # in the protocol line above it: the app reads the fail event, while a script
+    # that only looks at $? gets an answer that does not depend on which of the
+    # steps happened to break. Not-root keeps 2, because that is the one failure
+    # whose remedy is outside this app.
+    [ "$setup_seq_rc" = 2 ] && return 2
+    setup_emit "done fail"
+    return 5
+  fi
+  return 0
+}
+
+# Announce, run, report. Returns 0 for success *and* for a deliberate skip
+# (reported as `skip`, never as `ok`), otherwise the command's status.
+setup_step() {
+  setup_name=$1
+  setup_msg=$2
+  shift 2
+  setup_emit "step $setup_name $setup_msg"
+  SETUP_SKIP_REASON=""
+  "$@"
+  setup_step_rc=$?
+  case "$setup_step_rc" in
+    0) setup_emit "ok $setup_name"; return 0 ;;
+    7) setup_emit "skip $setup_name ${SETUP_SKIP_REASON:-already done}"; return 0 ;;
+    *) setup_emit "fail $setup_name exit $setup_step_rc"; return "$setup_step_rc" ;;
+  esac
+}
+
+setup_step_probe() {
+  [ -f "$DSH_BASE/tools/probe.sh" ] || {
+    setup_emit "note tools/probe.sh is missing from the payload"
+    return 3
+  }
+  setup_command "$SETUP_LOG" sh "$DSH_BASE/tools/probe.sh" --save "$DSH_LOG/p0.txt"
+  step_rc=$?
+  [ "$step_rc" = 0 ] || setup_emit "note the Phase 0 report is at $DSH_LOG/p0.txt"
+  return "$step_rc"
+}
+
+setup_step_rootfs() {
+  if [ "$SETUP_REPLACE_ROOTFS" != 1 ] &&
+    [ -x "$DSH_ROOTFS/bin/sh" ] &&
+    [ -x "$(host_path "$DSH_NODE")" ]; then
+    SETUP_SKIP_REASON="the Linux base is already installed"
+    return 7
+  fi
+  [ -f "$DSH_BASE/tools/rootfs-setup.sh" ] || {
+    setup_emit "note tools/rootfs-setup.sh is missing from the payload"
+    return 3
+  }
+  if [ "$SETUP_REPLACE_ROOTFS" = 1 ]; then
+    setup_command "$SETUP_LOG" sh "$DSH_BASE/tools/rootfs-setup.sh" --force
+  else
+    setup_command "$SETUP_LOG" sh "$DSH_BASE/tools/rootfs-setup.sh"
+  fi
+  step_rc=$?
+  [ "$step_rc" = 0 ] ||
+    setup_emit "note if the base is present but incomplete, re-run with --replace-rootfs (it deletes $DSH_ROOTFS)"
+  return "$step_rc"
+}
+
+# install-harness.sh is already idempotent against its own manifest, and it is
+# the only thing that knows the pin, so setup passes it no version: a second copy
+# of the pin here is a second thing to forget to bump.
+setup_step_harness() {
+  [ -f "$DSH_BASE/tools/install-harness.sh" ] || {
+    setup_emit "note tools/install-harness.sh is missing from the payload"
+    return 3
+  }
+  setup_command "$SETUP_LOG" sh "$DSH_BASE/tools/install-harness.sh"
+}
+
+setup_step_confinement() {
+  if [ -f "$DSH_STATE/posture.conf" ] && [ "$SETUP_RECHECK" != 1 ]; then
+    SETUP_SKIP_REASON="posture already recorded: $(confinement_status)"
+    return 7
+  fi
+  [ -f "$DSH_BASE/tools/confinement-check.sh" ] || {
+    setup_emit "note tools/confinement-check.sh is missing from the payload; refusing to record a posture that nothing proved"
+    return 3
+  }
+  setup_command "$SETUP_LOG" sh "$DSH_BASE/tools/confinement-check.sh" --save "$DSH_STATE/posture.conf"
+  step_rc=$?
+  case "$step_rc" in
+    0)
+      setup_emit "note confinement: $(confinement_status)"
+      return 0
+      ;;
+    5)
+      # Not fatal, and not silent: the plan's answer to an unproven Landlock is
+      # to pin the fallback and say so. The app repeats this on its status
+      # screen, because someone who never opens a log still has to know.
+      setup_emit "note confinement is NOT proven on this device: the agent runs with full access to the Linux base. Say so before trusting it with anything."
+      return 0
+      ;;
+    *) return "$step_rc" ;;
+  esac
+}
+
+setup_step_firewall() {
+  [ -f "$DSH_BASE/tools/firewall.sh" ] || {
+    setup_emit "note tools/firewall.sh is missing from the payload"
+    return 3
+  }
+  DSH_APP_UID="$SETUP_APP_UID" \
+    setup_command "$SETUP_LOG" sh "$DSH_BASE/tools/firewall.sh" apply --uid "$SETUP_APP_UID"
+  step_rc=$?
+  if [ "$step_rc" = 5 ] && [ "$SETUP_ALLOW_UNENFORCED" = 1 ]; then
+    setup_emit "note the rule is NOT enforced and --allow-unenforced-firewall was given: every app on this device can open the guard port, and the token is then the only thing in front of the harness."
+    return 0
+  fi
+  [ "$step_rc" = 5 ] &&
+    setup_emit "note no rule was installed, so other apps can reach the guard port. Fix the cause above, or re-run with --allow-unenforced-firewall to accept that and carry on."
+  return "$step_rc"
+}
+
+# The config is sourced by dshd as root, so every value written into it is a root
+# command waiting to happen: values are quoted, and the numeric fields are
+# validated before they get this far.
+setup_shell_quote() {
+  case "$1" in
+    *"'"* | *'
+'*) return 1 ;;
+    *) printf "'%s'" "$1" ;;
+  esac
+}
+
+setup_step_config() {
+  setup_conf="$DSH_ETC/dshd.conf"
+  setup_marker="# managed by dshd setup"
+  if [ -f "$setup_conf" ] && ! grep -qF "$setup_marker" "$setup_conf" 2>/dev/null; then
+    setup_emit "note $setup_conf was not written by setup — leaving it alone, and using --app-uid for this run only"
+    return 0
+  fi
+  setup_base_q=$(setup_shell_quote "$DSH_BASE") || {
+    setup_emit "note refusing to write a config with a quote in DSH_BASE"
+    return 3
+  }
+  if [ "$SETUP_BOOT" = install ]; then
+    setup_autostart=on
+  else
+    setup_autostart=off
+  fi
+  setup_content="$setup_marker
+# Written by 'dshd setup', which is what the APK runs. dshd sources this file, so
+# it is shell: keep values quoted or numeric. The marker line above is what stops
+# the next setup run from overwriting your edits.
+DSH_BASE=$setup_base_q
+DSH_APP_UID=$SETUP_APP_UID
+DSH_FIREWALL=on
+DSH_HARNESS_PORT=$DSH_HARNESS_PORT
+DSH_GUARD_PORT=$DSH_GUARD_PORT
+autostart=$setup_autostart"
+  if [ "$DSHD_DRY_RUN" = 1 ]; then
+    log "dry-run: would write $setup_conf (app uid $SETUP_APP_UID, firewall on, autostart $setup_autostart)"
+    return 0
+  fi
+  (umask 077; mkdir -p "$DSH_ETC" && printf '%s\n' "$setup_content" >"$setup_conf") || {
+    setup_emit "note cannot write $setup_conf"
+    return 3
+  }
+  return 0
+}
+
+setup_step_boot() {
+  case "$SETUP_BOOT" in
+    install) cmd_boot install ;;
+    remove) cmd_boot remove ;;
+    *)
+      SETUP_SKIP_REASON="autostart was not requested"
+      return 7
+      ;;
+  esac
+}
+
+setup_step_start() {
+  cmd_start
+}
+
+cmd_setup() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --app-uid)
+        shift
+        SETUP_APP_UID=${1:-}
+        ;;
+      --recheck) SETUP_RECHECK=1 ;;
+      --allow-unenforced-firewall) SETUP_ALLOW_UNENFORCED=1 ;;
+      --replace-rootfs) SETUP_REPLACE_ROOTFS=1 ;;
+      --boot)
+        shift
+        SETUP_BOOT=${1:-}
+        ;;
+      --check)
+        shift
+        cmd_setup_check "$@"
+        return $?
+        ;;
+      -h | --help)
+        usage
+        return 0
+        ;;
+      *)
+        log "ERROR: unknown argument '$1' to setup (try --help)" >&2
+        return 1
+        ;;
+    esac
+    shift
+  done
+
+  require_root
+
+  # A numeric uid is not decoration: it lands in a config file that root sources
+  # and in an iptables rule that decides who reaches the port. Anything else is
+  # refused rather than escaped.
+  case "$SETUP_APP_UID" in
+    '')
+      log "ERROR: setup needs --app-uid <uid> — it is the uid the firewall rule lets through. The APK passes its own (android.os.Process.myUid())." >&2
+      return 1
+      ;;
+    *[!0-9]*)
+      log "ERROR: --app-uid must be numeric, got '$SETUP_APP_UID'" >&2
+      return 1
+      ;;
+  esac
+  case "$DSH_HARNESS_PORT$DSH_GUARD_PORT" in
+    *[!0-9]*)
+      log "ERROR: ports must be numeric" >&2
+      return 1
+      ;;
+  esac
+  case "$SETUP_BOOT" in
+    install | remove | skip) ;;
+    *)
+      log "ERROR: --boot takes install, remove or skip, got '$SETUP_BOOT'" >&2
+      return 1
+      ;;
+  esac
+
+  ensure_dirs
+  SETUP_LOG="$DSH_LOG/setup.log"
+  # mkdir directly rather than through run(): under DSHD_DRY_RUN the directory
+  # would not exist, and a run whose journal silently does not exist is a run
+  # nobody can diagnose afterwards. --check and the dry-run tests both come
+  # through here.
+  mkdir -p "$DSH_LOG" 2>/dev/null
+  : >"$SETUP_LOG" 2>/dev/null || true
+  SETUP_NONCE=$(setup_nonce)
+  setup_emit "begin app_uid=$SETUP_APP_UID payload=$(setup_payload_digest) dshd=$DSHD_VERSION"
+  log "setup: app uid $SETUP_APP_UID, journal $SETUP_LOG"
+
+  setup_seq probe "checking what this device can do" setup_step_probe || return $?
+  setup_seq rootfs "installing the Linux base (about 1 GB, first run only)" setup_step_rootfs || return $?
+  setup_seq harness "installing the pinned DeepSeek Harness" setup_step_harness || return $?
+  setup_seq confinement "checking the agent's sandbox" setup_step_confinement || return $?
+  setup_seq firewall "keeping other apps off the ports" setup_step_firewall || return $?
+  setup_seq config "saving settings" setup_step_config || return $?
+  case "$SETUP_BOOT" in
+    install | remove) setup_seq boot "installing boot autostart" setup_step_boot || return $? ;;
+  esac
+  setup_seq start "starting the server" setup_step_start || return $?
+
+  setup_url_text=$(cmd_url 2>/dev/null | tail -n 1)
+  if [ -n "$setup_url_text" ]; then
+    setup_emit "url $setup_url_text"
+  else
+    setup_emit "note the running URL could not be read back; 'dshd url' will say why"
+  fi
+  setup_emit "done ok"
+  return 0
+}
+
+# What the app asks before it decides which screen to show. Machine-readable on
+# the same protocol, so the app has one parser and not two grammars.
+cmd_setup_check() {
+  require_root
+  SETUP_NONCE=check
+
+  check_installed=no
+  if [ -x "$DSH_ROOTFS/bin/sh" ] && [ -x "$(host_path "$DSH_NODE")" ]; then
+    check_installed=yes
+  fi
+  check_harness=no
+  [ -x "$(host_path "$DSH_HARNESS_BIN")" ] && check_harness=yes
+  check_running=no
+  if check_pid=$(read_pid_file "$DSH_RUN/supervisor.pid") && pid_is_ours "$check_pid" dshd; then
+    check_running=yes
+  fi
+
+  setup_emit "info installed $check_installed"
+  setup_emit "info harness $check_harness"
+  setup_emit "info running $check_running"
+  setup_emit "info posture $(confinement_status)"
+  setup_emit "info payload $(setup_payload_digest)"
+  setup_emit "info root $(root_solution)"
+  check_uid=$(sed -n 's/^DSH_APP_UID=//p' "$DSH_ETC/dshd.conf" 2>/dev/null | head -n 1)
+  setup_emit "info app_uid ${check_uid:-unset}"
+  if [ "$check_running" = yes ]; then
+    check_url=$(cmd_url 2>/dev/null | tail -n 1)
+    [ -n "$check_url" ] && setup_emit "url $check_url"
+  fi
+  [ "$check_installed" = yes ] && return 0
+  return 3
+}
+
+# ---------------------------------------------------------------------------
+# boot — autostart through the root solution's own service directory
+# ---------------------------------------------------------------------------
+
+# Read without sourcing: this must not change dshd's environment.
+boot_autostart() {
+  boot_v=$(sed -n 's/^autostart=//p' "$DSH_ETC/dshd.conf" 2>/dev/null | tail -n 1)
+  printf '%s\n' "${boot_v:-off}"
+}
+
+# Flip one key, keeping every other line — including comments a person added.
+set_autostart() {
+  want=$1
+  conf="$DSH_ETC/dshd.conf"
+  if [ "$DSHD_DRY_RUN" = 1 ]; then
+    log "dry-run: would set autostart=$want in $conf"
+    return 0
+  fi
+  (umask 077; mkdir -p "$DSH_ETC") || return 3
+  if [ ! -f "$conf" ]; then
+    (umask 077; printf 'autostart=%s\n' "$want" >"$conf") || return 3
+    return 0
+  fi
+  tmp="$conf.tmp.$$"
+  sed "s/^autostart=.*/autostart=$want/" "$conf" >"$tmp" || {
+    rm -f "$tmp"
+    return 3
+  }
+  grep -q '^autostart=' "$tmp" || printf 'autostart=%s\n' "$want" >>"$tmp"
+  chmod 0600 "$tmp" 2>/dev/null
+  mv "$tmp" "$conf" || {
+    rm -f "$tmp"
+    return 3
+  }
+  return 0
+}
+
+cmd_boot() {
+  require_root
+  boot_action=${1:-status}
+  boot_src="$DSH_BASE/boot/service.d/dshd.sh"
+
+  case "$boot_action" in
+    install)
+      [ -f "$boot_src" ] || {
+        log "ERROR: $boot_src is missing from the payload" >&2
+        return 3
+      }
+      [ -d "$BOOT_SCRIPT_DIR" ] || {
+        log "ERROR: $BOOT_SCRIPT_DIR does not exist — there is no root-solution service directory to install into" >&2
+        return 3
+      }
+      run cp "$boot_src" "$BOOT_SCRIPT" || return 4
+      run chmod 0755 "$BOOT_SCRIPT" || return 4
+      set_autostart on || return 4
+      log "autostart installed at $BOOT_SCRIPT"
+      return 0
+      ;;
+    remove)
+      if [ -f "$BOOT_SCRIPT" ] && [ -f "$boot_src" ] && cmp -s "$boot_src" "$BOOT_SCRIPT"; then
+        run rm -f "$BOOT_SCRIPT" || return 4
+        log "removed $BOOT_SCRIPT"
+      else
+        log "$BOOT_SCRIPT is not the copy dshd installs — leaving it in place; autostart=off is what disables it"
+      fi
+      set_autostart off || return 4
+      log "autostart off"
+      return 0
+      ;;
+    status)
+      if [ ! -f "$BOOT_SCRIPT" ]; then
+        printf 'not installed %s\n' "$BOOT_SCRIPT"
+      elif [ -f "$boot_src" ] && cmp -s "$boot_src" "$BOOT_SCRIPT"; then
+        printf 'installed     %s (matches the payload)\n' "$BOOT_SCRIPT"
+      else
+        printf 'installed     %s (not the copy dshd installs, or stale)\n' "$BOOT_SCRIPT"
+      fi
+      printf 'autostart     %s\n' "$(boot_autostart)"
+      return 0
+      ;;
+    *)
+      log "ERROR: boot takes install, remove or status, got '$boot_action'" >&2
+      return 1
+      ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 dshd $DSHD_VERSION — DeepSeek Harness supervisor for rooted Android
@@ -1040,6 +1528,21 @@ usage: dshd <command> [args]
   start              ensure mounts + token, spawn supervisor, wait for readiness
   stop               stop children, tear down mounts
   restart            stop then start
+  setup [options]    the whole install in order and non-interactively, with a
+                     ##dshd progress protocol on stdout. This is the one command
+                     the APK runs, over su; nothing about it needs a terminal.
+                       --app-uid N        the uid the firewall rule lets through
+                                          (the APK passes its own)
+                       --boot install|remove|skip   autostart via service.d
+                       --recheck          re-run the Phase 3 posture check
+                       --replace-rootfs   delete and re-fetch $DSH_ROOTFS
+                       --allow-unenforced-firewall  carry on when no rule could
+                                          be installed; says what stays exposed
+  setup --check      machine-readable state on the same protocol, for the app;
+                     exit 3 means "not set up yet"
+  boot install|remove|status
+                     autostart through /data/adb/service.d, and the autostart=
+                     key in dshd.conf that gates it
   status             process, port, permission, confinement, root, mount summary
   root               which root solution granted this shell, and which su the
                      APK should use (Magisk, KernelSU, KernelSU-Next)
@@ -1056,6 +1559,7 @@ usage: dshd <command> [args]
 
 Environment (or $CONF):
   DSH_BASE        $DSH_BASE
+  DSH_BOOT_SERVICE_DIR $DSH_BOOT_SERVICE_DIR   (dshd boot install target)
   DSH_HARNESS_PORT $DSH_HARNESS_PORT   (loopback only, never exposed)
   DSH_GUARD_PORT  $DSH_GUARD_PORT   (the only port the app talks to)
   DSH_FIREWALL    $DSH_FIREWALL   auto|on|off
@@ -1063,7 +1567,9 @@ Environment (or $CONF):
   DSHD_NO_CHROOT  $DSHD_NO_CHROOT   (1 = dev mode: no chroot, no mounts)
   DSHD_DRY_RUN    $DSHD_DRY_RUN   (1 = log instead of mutating)
 
-Exit codes: 0 ok · 1 usage · 2 not root · 3 not running · 4 start timed out
+Exit codes: 0 ok · 1 usage · 2 not root · 3 not running · 4 start timed out ·
+             5 a setup step failed (the step's own status is in the fail event;
+             the payload bootstrap adds 6, for a payload that did not verify)
 EOF
 }
 
@@ -1088,6 +1594,8 @@ main() {
     start) cmd_start ;;
     stop) cmd_stop ;;
     restart) cmd_restart ;;
+    setup) cmd_setup "$@" ;;
+    boot) cmd_boot "$@" ;;
     status) cmd_status ;;
     root) cmd_root ;;
     token) cmd_token ;;
