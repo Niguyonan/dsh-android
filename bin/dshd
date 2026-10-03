@@ -1568,8 +1568,10 @@ Environment (or $CONF):
   DSHD_DRY_RUN    $DSHD_DRY_RUN   (1 = log instead of mutating)
 
 Exit codes: 0 ok · 1 usage · 2 not root · 3 not running · 4 start timed out ·
-             5 a setup step failed (the step's own status is in the fail event;
-             the payload bootstrap adds 6, for a payload that did not verify)
+             5 a setup step failed (the step's own status is in the fail event)
+             The payload bootstrap runs before this and adds two of its own:
+             6 the payload did not verify · 7 the install directory is not safe.
+             Both name the check that refused, on the ##dshd protocol.
 EOF
 }
 
