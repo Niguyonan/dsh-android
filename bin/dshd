@@ -8,8 +8,12 @@
 #   * start/stop/restart/status, crash restart with backoff, log rotation,
 #     stale-PID cleanup
 #
-# POSIX sh on purpose: this runs under Magisk's `mksh`, where bashisms like
-# [[ ]], arrays, and `wait -n` are not available. Run with `sh -n bin/dshd` to
+# POSIX sh on purpose: this runs as a root shell on Android — Magisk's `mksh`,
+# KernelSU's BusyBox `ash` with Standalone Mode (which is what KernelSU runs
+# boot scripts in), or a plain `sh -c` from the APK — where bashisms like [[ ]],
+# arrays, and `wait -n` are not available. Nothing here may assume which root
+# solution granted uid 0: `dshd root` reports what it found, and docs/
+# root-solutions.md records how the three differ. Run with `sh -n bin/dshd` to
 # syntax-check, and see tests/run.sh for the host-side lifecycle tests.
 #
 # Path model — the one thing to get right:
@@ -282,6 +286,155 @@ cmd_token() {
   token_file=$(token_path)
   [ -f "$token_file" ] || die "no token yet — start the supervisor first"
   cat "$token_file"
+}
+
+# ---------------------------------------------------------------------------
+# Root solution: Magisk, KernelSU, KernelSU-Next
+# ---------------------------------------------------------------------------
+#
+# dshd does not care which one granted root — it needs uid 0, a working su to
+# point the APK at, and a su context that is allowed to mount and to run
+# iptables. What differs between the three is exactly those things, so this
+# reports them instead of assuming Magisk:
+#
+#   * KernelSU and KernelSU-Next share /data/adb/ksu and /data/adb/ksud (their
+#     ksud/src/defs.rs agree on WORKING_DIR and DAEMON_PATH; only the backup file
+#     prefix differs), so they are one code path with two version strings.
+#   * Magisk keeps /data/adb/magisk and a su at /debug_ramdisk/su on 24+.
+#   * Both can be installed at once: KernelSU hooks the kernel, Magisk the
+#     ramdisk. The FAQ says KernelSU's su coexists with Magisk, so "both" is a
+#     state to report, not an error.
+#
+# DSH_ADB is overridable so the host tests can point this at a fake tree.
+
+: "${DSH_ADB:=/data/adb}"
+
+ROOT_MAGISK_DIR="$DSH_ADB/magisk"
+ROOT_KSU_DIR="$DSH_ADB/ksu"
+ROOT_KSUD="$DSH_ADB/ksud"
+
+# Su binaries, in the order that has actually worked across the three solutions.
+# PATH first: when dshd runs from a root shell, that is the shell the operator
+# was granted, and it is the one whose mount namespace this process inherits.
+su_candidates() {
+  s=$(command -v su 2>/dev/null) && [ -n "$s" ] && printf '%s\n' "$s"
+  printf '%s\n' "$ROOT_KSU_DIR/bin/su"   # KernelSU, KernelSU-Next
+  printf '%s\n' "/debug_ramdisk/su"      # Magisk 24+
+  printf '%s\n' "/sbin/su"               # older Magisk
+  printf '%s\n' "/system/bin/su"         # traditional, and some KernelSU setups
+}
+
+su_binary() {
+  for c in $(su_candidates); do
+    [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+magisk_version() {
+  m="$ROOT_MAGISK_DIR/magisk"
+  if [ ! -x "$m" ]; then
+    m=$(command -v magisk 2>/dev/null) || return 1
+  fi
+  [ -n "${m:-}" ] && [ -x "$m" ] || return 1
+  "$m" -v 2>/dev/null | head -n 1
+}
+
+ksu_version() {
+  k=""
+  [ -x "$ROOT_KSUD" ] && k="$ROOT_KSUD"
+  [ -z "$k" ] && k=$(command -v ksud 2>/dev/null)
+  [ -n "${k:-}" ] || return 1
+  out=$("$k" --version 2>/dev/null) || out=$("$k" -V 2>/dev/null)
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out" | head -n 1
+}
+
+# KernelSU or KernelSU-Next? The version string is the cheap signal; when it is
+# uninformative, the two managers are separate packages, which is authoritative.
+ksu_variant() {
+  case "$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z')" in
+    *next* | *ksun*) printf 'kernelsu-next\n'; return 0 ;;
+  esac
+  if command_exists pm && pm list packages 2>/dev/null | grep -q 'com.rifsxd.ksunext'; then
+    printf 'kernelsu-next\n'
+    return 0
+  fi
+  printf 'kernelsu\n'
+}
+
+# What is installed, in one word: magisk | kernelsu | kernelsu-next | both |
+# none | unknown. "both" is honest: it says the su that granted this shell is
+# not identifiable from paths alone, and `dshd root` prints the detail.
+root_solution() {
+  have_ksu=0
+  have_magisk=0
+  if [ -x "$ROOT_KSUD" ] || [ -d "$ROOT_KSU_DIR" ] || command_exists ksud; then
+    have_ksu=1
+  fi
+  if [ -d "$ROOT_MAGISK_DIR" ] || command_exists magisk; then
+    have_magisk=1
+  fi
+
+  if [ "$have_ksu" = 1 ] && [ "$have_magisk" = 1 ]; then
+    printf 'both\n'
+  elif [ "$have_ksu" = 1 ]; then
+    ksu_variant "$(ksu_version)"
+  elif [ "$have_magisk" = 1 ]; then
+    printf 'magisk\n'
+  else
+    printf 'none\n'
+  fi
+}
+
+# The SELinux context this shell is actually running in, which is the thing that
+# decides whether mount and iptables are permitted. Magisk uses u:r:magisk:s0,
+# KernelSU u:r:su:s0 by default, and both let the user change it per app, so this
+# is read rather than assumed.
+selinux_context() {
+  if [ -r /proc/self/attr/current ]; then
+    tr -d '\000' </proc/self/attr/current
+  else
+    printf 'unknown\n'
+  fi
+}
+
+root_summary() {
+  solution=$(root_solution)
+  version=""
+  case "$solution" in
+    magisk) version=$(magisk_version) ;;
+    kernelsu | kernelsu-next) version=$(ksu_version) ;;
+    both)
+      mv_=$(magisk_version)
+      kv_=$(ksu_version)
+      version="magisk ${mv_:-?}, $(ksu_variant "$kv_") ${kv_:-?}"
+      ;;
+  esac
+  printf '%s%s (%s)\n' "$solution" "${version:+ $version}" "$(selinux_context)"
+}
+
+cmd_root() {
+  printf 'solution:    %s\n' "$(root_solution)"
+  printf 'magisk:      %s\n' "$(magisk_version 2>/dev/null || printf 'not found')"
+  ksuv=$(ksu_version 2>/dev/null) || ksuv=""
+  printf 'kernelsu:    %s%s\n' "${ksuv:-not found}" \
+    "$([ -n "$ksuv" ] && printf ' [%s]' "$(ksu_variant "$ksuv")")"
+  printf 'selinux:     %s\n' "$(selinux_context)"
+  selinux_state="unknown"
+  command_exists getenforce && selinux_state=$(getenforce 2>/dev/null)
+  printf 'getenforce:  %s\n' "$selinux_state"
+  printf 'adb dir:     %s\n' "$DSH_ADB"
+  for d in magisk ksu; do
+    if [ -d "$DSH_ADB/$d" ]; then printf '  %s/          present\n' "$d"; else printf '  %s/          absent\n' "$d"; fi
+  done
+  printf 'su:          %s\n' "$(su_binary 2>/dev/null || printf 'NOT FOUND — the APK cannot fetch the token')"
+  printf 'su search:   %s\n' "$(su_candidates | tr '\n' ' ')"
+  # Whether the su a *new* session gets is ours matters for mounts: a bind mount
+  # made here lives in this mount namespace, and only descendants inherit it.
+  printf 'note:        mounts made by dshd are visible to its children; a separate\n'
+  printf '             su session may be in a different mount namespace (see\n'
+  printf '             docs/root-solutions.md and run tools/probe.sh).\n'
 }
 
 # ---------------------------------------------------------------------------
@@ -728,6 +881,7 @@ cmd_status() {
 
   printf 'permission:  %s\n' "$(permission_mode)"
   printf 'confinement: %s\n' "$(confinement_status)"
+  printf 'root:        %s\n' "$(root_summary)"
   printf 'firewall:    %s (app uid: %s)\n' "$DSH_FIREWALL" "${DSH_APP_UID:-unset}"
   printf 'home:        %s (in-chroot %s)\n' "$DSH_STATE" "$DSH_STATE_IN"
   printf 'workspace:   %s (in-chroot %s)\n' "$DSH_WORKSPACE" "$DSH_WORKSPACE_IN"
@@ -791,7 +945,9 @@ usage: dshd <command> [args]
   start              ensure mounts + token, spawn supervisor, wait for readiness
   stop               stop children, tear down mounts
   restart            stop then start
-  status             process, port, permission, confinement, mount summary
+  status             process, port, permission, confinement, root, mount summary
+  root               which root solution granted this shell, and which su the
+                     APK should use (Magisk, KernelSU, KernelSU-Next)
   token              print the guard token (§7); the APK fetches this via su
   logs [-f]          last lines of dshd/harness/guard logs, or follow
   mounts             ensure the chroot bind mounts exist
@@ -834,6 +990,7 @@ main() {
     stop) cmd_stop ;;
     restart) cmd_restart ;;
     status) cmd_status ;;
+    root) cmd_root ;;
     token) cmd_token ;;
     logs) cmd_logs "$@" ;;
     mounts) cmd_mounts ;;

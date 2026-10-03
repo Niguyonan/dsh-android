@@ -150,6 +150,12 @@ env_new() {
     DSH_POLL_INTERVAL DSH_START_TIMEOUT DSH_STOP_TIMEOUT DSH_BACKOFF_MIN \
     DSH_BACKOFF_MAX DSH_LOG_MAX_BYTES DSH_LOG_KEEP
 
+  # A fake /data/adb, so root detection is hermetic: a host that happens to have
+  # Magisk or KernelSU installed must not change what these tests measure.
+  DSH_ADB="$TMP/adb"
+  export DSH_ADB
+  mkdir -p "$DSH_ADB"
+
   # Per-case hygiene: one case's exports must not decide the next case's
   # behaviour (the firewall cases set DSH_FIREWALL=on on purpose).
   unset DSH_PERMISSION_MODE 2>/dev/null || true
@@ -228,6 +234,7 @@ case_status_fresh() {
   contains "status reports confinement as unresolved" "confinement: unresolved (run tools/confinement-check.sh)" "$out"
   contains "status defaults to workspace-write" "permission: workspace-write" "$out"
   contains "status shows the in-chroot path model" "(in-chroot /state)" "$out"
+  contains "status names the root solution" "root: none (unknown)" "$out"
 }
 
 case_token_absent() {
@@ -633,7 +640,139 @@ case_orphaned_children() {
 }
 
 # ===========================================================================
-# 7. §7 firewall integration
+# 7. Root solutions: Magisk, KernelSU, KernelSU-Next
+# ===========================================================================
+#
+# KernelSU and KernelSU-Next share /data/adb/ksu and /data/adb/ksud (their
+# ksud/src/defs.rs agree on WORKING_DIR and DAEMON_PATH), so they are one code
+# path with two version strings. Magisk keeps /data/adb/magisk, and the two can
+# be installed at once — the FAQ says KernelSU's su coexists with Magisk — so
+# "both" is a state to report rather than an error.
+
+case_root_solutions() {
+  env_new
+  mkdir -p "$DSH_ADB/ksu/bin"
+
+  cat >"$DSH_ADB/ksud" <<'EOF'
+#!/bin/sh
+printf 'v1.0.6 (uapi: 2)\n'
+EOF
+  chmod +x "$DSH_ADB/ksud"
+  out=$(dshd root 2>&1)
+  contains "detects KernelSU from /data/adb/ksud" "solution:    kernelsu" "$out"
+  contains "reports the KernelSU version" "kernelsu:    v1.0.6 (uapi: 2)" "$out"
+
+  # Same paths, different version string: this is the only thing that separates
+  # KernelSU-Next from KernelSU at the filesystem level.
+  cat >"$DSH_ADB/ksud" <<'EOF'
+#!/bin/sh
+printf 'v3.0.0-ksunext (uapi: 2)\n'
+EOF
+  chmod +x "$DSH_ADB/ksud"
+  out=$(dshd root 2>&1)
+  contains "distinguishes KernelSU-Next" "solution:    kernelsu-next" "$out"
+
+  # Magisk alone.
+  rm -f "$DSH_ADB/ksud"
+  rmdir "$DSH_ADB/ksu/bin" "$DSH_ADB/ksu"
+  mkdir -p "$DSH_ADB/magisk"
+  cat >"$DSH_ADB/magisk/magisk" <<'EOF'
+#!/bin/sh
+printf '27.0:MAGISK\n'
+EOF
+  chmod +x "$DSH_ADB/magisk/magisk"
+  out=$(dshd root 2>&1)
+  contains "detects Magisk from /data/adb/magisk" "solution:    magisk" "$out"
+  contains "reports the Magisk version" "magisk:      27.0:MAGISK" "$out"
+
+  # Both at once is a real configuration, not a broken one.
+  mkdir -p "$DSH_ADB/ksu/bin"
+  cat >"$DSH_ADB/ksud" <<'EOF'
+#!/bin/sh
+printf 'v1.0.6 (uapi: 2)\n'
+EOF
+  chmod +x "$DSH_ADB/ksud"
+  out=$(dshd root 2>&1)
+  contains "reports both when both are installed" "solution:    both" "$out"
+  out=$(squeeze "$(dshd status 2>&1)")
+  contains "status names both when both are installed" \
+    "root: both magisk 27.0:MAGISK, kernelsu v1.0.6" "$out"
+}
+
+# KernelSU shells are not guaranteed to have `su` in PATH (tiann/KernelSU#2647),
+# so the fallback to the KernelSU binary is the path that matters. Test it with
+# a PATH that has no su at all, rather than trusting the host's.
+case_su_resolution() {
+  env_new
+  mkdir -p "$DSH_ADB/ksu/bin" "$TMP/path"
+  cat >"$DSH_ADB/ksud" <<'EOF'
+#!/bin/sh
+printf 'v1.0.6 (uapi: 2)\n'
+EOF
+  chmod +x "$DSH_ADB/ksud"
+  cat >"$DSH_ADB/ksu/bin/su" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$DSH_ADB/ksu/bin/su"
+
+  for c in tr head grep sed; do
+    [ -n "$(command -v "$c" 2>/dev/null)" ] && ln -sf "$(command -v "$c")" "$TMP/path/$c"
+  done
+
+  out=$(PATH="$TMP/path" /bin/sh "$DSHD" root 2>&1)
+  contains "finds the KernelSU su when PATH has none" "su:          $DSH_ADB/ksu/bin/su" "$out"
+
+  # And with no su anywhere, it says so instead of printing a path that is not
+  # there — the APK's token fetch depends on this being honest.
+  rm -f "$DSH_ADB/ksu/bin/su"
+  out=$(PATH="$TMP/path" /bin/sh "$DSHD" root 2>&1)
+  contains "says so when there is no su at all" "NOT FOUND" "$out"
+}
+
+# ===========================================================================
+# 8. Boot autostart (/data/adb/service.d on all three root solutions)
+# ===========================================================================
+
+case_boot_autostart() {
+  env_new
+  BOOT="$REPO/boot/service.d/dshd.sh"
+  mkdir -p "$DSH_BASE/bin"
+  cat >"$DSH_BASE/bin/dshd" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >>"$TMP/dshd.calls"
+exit 0
+EOF
+  chmod +x "$DSH_BASE/bin/dshd"
+  make_id_double
+
+  # Opt-in: without autostart=on in the config, nothing happens.
+  out=$(KSU=true DSH_BASE="$DSH_BASE" DSH_AUTOSTART_WAIT=0 /bin/sh "$BOOT" 2>&1)
+  check "autostart is off by default" "0" "$?"
+  if [ -f "$TMP/dshd.calls" ]; then fail "autostart does not start dshd unless asked"; else pass "autostart does not start dshd unless asked"; fi
+
+  printf 'autostart=on\n' >"$DSH_BASE/etc/dshd.conf"
+  out=$(KSU=true DSH_BASE="$DSH_BASE" DSH_AUTOSTART_WAIT=0 /bin/sh "$BOOT" 2>&1)
+  check "autostart=on exits 0" "0" "$?"
+  check "autostart=on calls dshd start" "start" "$(cat "$TMP/dshd.calls" 2>/dev/null)"
+
+  # KernelSU sets KSU=true in the scripts it runs; the log should say so, because
+  # "which root solution ran this" is the first question when it misbehaves.
+  contains "the autostart log names KernelSU" "dshd-autostart[KernelSU]" "$(cat "$DSH_LOG/autostart.log" 2>/dev/null)"
+
+  # KernelSU runs general scripts only if they are executable; the script itself
+  # must not be the reason it silently never runs.
+  if [ -x "$BOOT" ]; then pass "the boot script is executable in the repo"; else fail "the boot script is executable in the repo"; fi
+
+  # Not installed: a missing install is not an error at boot.
+  rm -f "$DSH_BASE/bin/dshd"
+  out=$(KSU=true DSH_BASE="$DSH_BASE" DSH_AUTOSTART_WAIT=0 /bin/sh "$BOOT" 2>&1)
+  check "a missing install exits 0 quietly" "0" "$?"
+  check "and prints nothing" "" "$out"
+}
+
+# ===========================================================================
+# 9. §7 firewall integration
 # ===========================================================================
 #
 # The rule set itself is tests/firewall.test.sh's job. What is tested here is the
@@ -728,6 +867,9 @@ case_start_idempotent
 case_stale_pid
 case_rotation
 case_supervise_loop
+case_root_solutions
+case_su_resolution
+case_boot_autostart
 case_firewall_missing
 case_firewall_handover
 case_real_pair
