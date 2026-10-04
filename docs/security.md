@@ -339,6 +339,29 @@ the whole selection is refused together rather than in part. Chromium applies th
 same rule in its own file dialog; WebView does not apply it for the app, and the
 platform says so in `FileChooserParams.createIntent()`'s javadoc.
 
+**What the page can save, and where it goes.** A WebView does not download
+anything by itself: an `<a download>` click and a `Content-Disposition:
+attachment` response both end at `DownloadListener`, and an app that sets no
+listener is told about the download and does nothing with it — the harness's
+"Download session log" said the browser was downloading the ZIP while no file was
+written anywhere. This app answers that listener itself, and it fetches the bytes
+from one origin only: the scheme, host and port the WebView was loaded from,
+compared on a boundary so a server on port 30810 cannot answer for a page pinned
+to 3081. The request carries the WebView's own cookies for that URL (the session
+is a cookie; a GET without it saves the login page), no `Origin` header (the
+guard refuses a cross-origin one, and a download is a navigation, not a
+cross-site request), and redirects are not followed, because a redirect is how a
+request leaves the pinned origin with the cookie still attached. `blob:` and
+`data:` are refused rather than guessed at: those bytes exist only inside the
+renderer and a native GET cannot reach them. The name is treated as untrusted
+input from a server — one path segment, no control characters, no separators,
+bounded length — because a `Content-Disposition` of `../../databases/dshd` would
+otherwise choose where a root-holding app writes. On Android 10 and later the
+file goes into the public Downloads collection through the media store, which
+needs no permission; before that it goes to this app's own external files
+directory and the message says so, because the alternative was
+`WRITE_EXTERNAL_STORAGE` for a device this app otherwise asks nothing of.
+
 **What the app keeps on disk.** The guard's session cookie, in the WebView's
 cookie store inside the app's private data directory. That is the same boundary
 the rest of this stack relies on: file permissions plus file-based encryption,

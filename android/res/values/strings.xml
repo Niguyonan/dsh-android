@@ -58,4 +58,11 @@
     <string name="pick_file">Choose a file</string>
     <string name="error_no_picker">No file picker on this device.</string>
     <string name="error_blocked_file">That file is blocked: the page does not get this app\'s own files.</string>
+
+    <string name="download_started">Downloading %1$s…</string>
+    <string name="download_saved">Saved to %1$s</string>
+    <string name="downloads_folder">Downloads/%1$s</string>
+    <string name="download_failed">Download failed: %1$s</string>
+    <string name="error_blocked_download">That download is not from this app\'s own server, so it was not saved.</string>
+    <string name="error_generated_download">The page made that file inside the browser, so this app cannot save it.</string>
 </resources>

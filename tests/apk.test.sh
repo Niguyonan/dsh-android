@@ -291,6 +291,93 @@ else
   skip "the protocol parser is exercised against real dshd output" "no JDK"
 fi
 
+# --- the download decisions -------------------------------------------------
+
+printf '\n== what the app will and will not save ==\n'
+
+DOWNLOAD_JAVA="$REPO/android/src/dev/dshd/app/Download.java"
+
+if have_jdk; then
+  mkdir -p "$TMP/dl"
+  if javac -source 8 -target 8 -Xlint:-options -d "$TMP/dl" "$DOWNLOAD_JAVA" 2>"$TMP/dl.err"; then
+    pass "Download.java compiles with plain javac (no Android on the classpath)"
+  else
+    fail "Download.java compiles with plain javac" "$(head -3 "$TMP/dl.err")"
+  fi
+
+  GUARD=http://127.0.0.1:3081
+  dl() { java -cp "$TMP/dl" dev.dshd.app.Download "$1" "$2" "$3" 2>&1; }
+  # The driver prints both decisions; the name is the line after the refusal, and
+  # comparing the whole answer is how one of them silently stops being tested.
+  name_of() { printf '%s\n' "$1" | sed -n 's/^name=//p'; }
+
+  # The harness's own bytes. `dsh-client-ui-deliverables`' sibling
+  # dsh-session-log-export answers its menu item by clicking an anchor on this
+  # route, and the route replies with `attachment; filename="dsh-session-…zip"`.
+  # A WebView hands that click to DownloadListener and an app with no listener
+  # saves nothing: the dialog said the browser was downloading the ZIP and there
+  # was no file in any folder.
+  out=$(dl 'attachment; filename="dsh-session-abc.zip"' \
+    "$GUARD/api/session.export?sessionId=abc&includeDescendants=true" "$GUARD")
+  contains "the harness's own download is answered" "refuse=null" "$out"
+  contains "and it is saved under the name the response gave" "name=dsh-session-abc.zip" "$out"
+
+  # A name is a name, not a path. Content-Disposition is a header from a server
+  # and this app is the one running as root and writing the file.
+  out=$(dl 'attachment; filename="../../databases/dshd"' "$GUARD/api/session.export" "$GUARD")
+  contains "a name that climbs out of the folder is cut to one segment" "name=dshd" "$out"
+  out=$(dl "attachment; filename*=UTF-8''%2e%2e%2f%2e%2e%2fetc%2fpasswd" "$GUARD/api/x" "$GUARD")
+  contains "and the same through a percent-encoded one" "name=passwd" "$out"
+  out=$(dl 'attachment; filename="a/b/c/report.zip"' "$GUARD/api/x" "$GUARD")
+  check "a quoted absolute-looking path keeps only its last segment" "report.zip" "$(name_of "$out")"
+
+  # The other encodings a real server sends, and the ones the harness does not.
+  out=$(dl "attachment; filename*=UTF-8''dsh%20session%20log.zip" "$GUARD/api/x" "$GUARD")
+  check "RFC 5987 ext-value names survive decoding" "dsh session log.zip" "$(name_of "$out")"
+  out=$(dl 'attachment; filename="session log.zip"' "$GUARD/api/x" "$GUARD")
+  check "a quoted name keeps its spaces" "session log.zip" "$(name_of "$out")"
+  out=$(dl 'attachment; filename=bare.zip' "$GUARD/api/x" "$GUARD")
+  check "and an unquoted one is read too" "bare.zip" "$(name_of "$out")"
+  out=$(dl 'attachment; filename="re:port?.zip"' "$GUARD/api/x" "$GUARD")
+  check "characters a filesystem refuses are dropped" "report.zip" "$(name_of "$out")"
+
+  # With no header at all the URL's last segment is the name, percent-decoded,
+  # with the query and fragment left out of it.
+  out=$(dl - "$GUARD/api/workspace/report%20final.pdf?rev=3#top" "$GUARD")
+  check "a URL names the file when the response does not" "report final.pdf" "$(name_of "$out")"
+  out=$(dl - "$GUARD/" "$GUARD")
+  check "and a URL with no name at all falls back" "download" "$(name_of "$out")"
+  out=$(dl 'attachment; filename=""' "$GUARD/" "$GUARD")
+  check "an empty name in the header falls back too" "download" "$(name_of "$out")"
+
+  # What must never be fetched. The page is agent-generated output and this app
+  # holds a session cookie for one loopback server.
+  out=$(dl - "blob:$GUARD/6f1e" "$GUARD")
+  contains "a file the page made in the renderer is refused" "refuse=generated" "$out"
+  out=$(dl - "data:text/plain,hello" "$GUARD")
+  contains "and so is a data: URL" "refuse=generated" "$out"
+  out=$(dl 'attachment; filename="x.zip"' "http://evil.example/x.zip" "$GUARD")
+  contains "a download from another host is refused" "refuse=external" "$out"
+  # The boundary, not the first characters: a prefix check that stops at
+  # startsWith lets a server on port 30810 answer for a login pinned to 3081.
+  out=$(dl 'attachment; filename="x.zip"' "http://127.0.0.1:30810/x.zip" "$GUARD")
+  contains "a host that merely starts with the origin is refused" "refuse=external" "$out"
+  out=$(dl - "file:///data/local/dsh/workspace/x" "$GUARD")
+  contains "a file: URL is refused" "refuse=scheme" "$out"
+  out=$(dl - - "$GUARD")
+  contains "and a download with no URL is not guessed at" "refuse=scheme" "$out"
+  out=$(dl - "$GUARD/api/x" -)
+  contains "nothing is fetched before a page has pinned an origin" "refuse=external" "$out"
+  # The same origin with a path, a query and no path at all is the one that is
+  # answered: a rule that refuses these would be a rule that never saves.
+  for u in "$GUARD/api/x" "$GUARD/?a=1" "$GUARD"; do
+    out=$(dl - "$u" "$GUARD")
+    contains "the pinned origin itself is answered: $u" "refuse=null" "$out"
+  done
+else
+  skip "the download decisions are exercised on the host" "no JDK"
+fi
+
 # --- source-level invariants ------------------------------------------------
 
 printf '\n== what the app must not do ==\n'
@@ -328,6 +415,27 @@ contains "a multiple selection is read from the ClipData" "data.getClipData()" "
 contains "a picked file that is this app's own is refused" \
   "getApplicationInfo().dataDir" "$sources"
 contains "compared on canonical paths, not on spelling" "getCanonicalPath()" "$sources"
+
+# The page's downloads. The same shape in the other direction: a WebView saves
+# nothing by itself, so the harness's "Download session log" reported success and
+# wrote no file anywhere. The app fetches the bytes itself — with the WebView's
+# own cookie, because the session that authenticates the page is a cookie, and
+# without following a redirect, because the one origin it trusts is the one it
+# pinned — and it says where the file went.
+contains "the page's downloads are answered at all" "onDownloadStart" "$sources"
+contains "by a listener that is set on the WebView" "setDownloadListener" "$sources"
+contains "the request carries the session the page is using" \
+  "CookieManager.getInstance().getCookie" "$sources"
+contains "and does not follow a redirect off the pinned origin" \
+  "setInstanceFollowRedirects(false)" "$sources"
+contains "the decision to fetch is Download.java's, not a second copy here" \
+  "Download.refuse(url, allowedPrefix)" "$sources"
+contains "public Downloads takes the file where the platform has one" \
+  "MediaStore.Downloads.EXTERNAL_CONTENT_URI" "$sources"
+contains "and before that, this app's own directory rather than a permission" \
+  "getExternalFilesDir" "$sources"
+contains "the message says where the file is, which is what was missing" \
+  "R.string.download_saved" "$sources"
 
 # The one command the app sends to root, and the mode it creates the install
 # directory with. That directory is where root runs scripts from, and leaving its
@@ -488,6 +596,14 @@ else
     # that silently answers the page's file input with null.
     check "the shipped dex answers the page's file input" "1" \
       "$(grep -ac -- 'onShowFileChooser' "$TMP/classes.dex")"
+    # And the other half of the same contract: a DownloadListener that never made
+    # it into the dex is a download button that silently writes nothing.
+    check "the shipped dex answers the page's downloads" "1" \
+      "$(grep -ac -- 'onDownloadStart' "$TMP/classes.dex")"
+    check "and carries the collection the file is saved in" "1" \
+      "$(grep -ac -- 'Landroid/provider/MediaStore$Downloads;' "$TMP/classes.dex")"
+    check "and the cookie header the fetch needs to be authenticated" "yes" \
+      "$(grep -aq -- 'Cookie' "$TMP/classes.dex" && echo yes || echo no)"
     unzip -p "$APK" assets/payload.id >"$TMP/from-apk.id" 2>/dev/null
     check "and the payload id the app compares against" "$(cat "$TMP/assets/payload.id")" "$(cat "$TMP/from-apk.id")"
 

@@ -3,18 +3,22 @@ package dev.dshd.app;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Process;
+import android.provider.MediaStore;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.CookieManager;
+import android.webkit.DownloadListener;
 import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
@@ -29,8 +33,14 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.Closeable;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -56,6 +66,11 @@ import java.util.List;
  *       — and the result of that picker is checked before the page is allowed to
  *       read it: the platform's own documentation says a file chooser result can
  *       point at this app's private files
+ *   <li>a download the page asks for is fetched by this app, with the WebView's
+ *       own cookie, and only from the origin the WebView was loaded from. A
+ *       WebView saves nothing by itself: with no DownloadListener the page is
+ *       told the browser is downloading its file while nothing is written
+ *       anywhere, which is what "the download button does nothing" was
  * </ul>
  */
 public final class MainActivity extends Activity implements RunState.Observer {
@@ -534,6 +549,21 @@ public final class MainActivity extends Activity implements RunState.Observer {
                 return askForFiles(callback, params);
             }
         });
+
+        // The same shape in the other direction. A WebView downloads nothing on
+        // its own — every download, an <a download> click or a response carrying
+        // Content-Disposition: attachment, is handed to this listener, and an app
+        // that sets none is handed it and drops it. The harness's Session menu
+        // says "Download session log", its dialog says the browser is downloading
+        // the ZIP, and no file appeared in any folder: the button did nothing,
+        // and there was nothing to find.
+        view.setDownloadListener(new DownloadListener() {
+            @Override
+            public void onDownloadStart(String url, String userAgent, String contentDisposition,
+                    String mimetype, long contentLength) {
+                startDownload(url, contentDisposition, mimetype);
+            }
+        });
         return view;
     }
 
@@ -668,6 +698,200 @@ public final class MainActivity extends Activity implements RunState.Observer {
             return !path.equals(own) && !path.startsWith(own + File.separator);
         } catch (IOException e) {
             return false;
+        }
+    }
+
+    /**
+     * Save a file the page asked for.
+     *
+     * <p>Called on the main thread by the WebView. {@link Download} decides
+     * whether the request may be answered and what the file is called; the bytes
+     * are fetched on a thread of this app's own, because the response is a stream
+     * the main thread must not wait on. Every outcome is said out loud, including
+     * the folder — the complaint that started this was not that the app crashed
+     * but that nobody could find the file.
+     */
+    private void startDownload(String url, String contentDisposition, String mimetype) {
+        String refusal = Download.refuse(url, allowedPrefix);
+        if (Download.REFUSE_GENERATED.equals(refusal)) {
+            toast(getString(R.string.error_generated_download));
+            return;
+        }
+        if (refusal != null) {
+            toast(getString(R.string.error_blocked_download));
+            return;
+        }
+        final String name = Download.filename(contentDisposition, url);
+        final String cookie = CookieManager.getInstance().getCookie(url);
+        final String agent = web == null ? null : web.getSettings().getUserAgentString();
+        toast(getString(R.string.download_started, name));
+        Thread worker = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                save(url, name, mimetype, cookie, agent);
+            }
+        }, "dshd-download");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    /**
+     * Fetch one download and store it, off the main thread.
+     *
+     * <p>The request carries the WebView's cookies for that URL, because the
+     * session that authenticates the page is a cookie and a GET without it would
+     * cheerfully save the login page under the file's name. That cookie is
+     * {@code HttpOnly} on the guard's side and this still reads it: the WebView
+     * builds its cookie line with every option inclusive, so the app sees what
+     * the page sees. No Origin header is
+     * sent: the guard refuses a cross-origin one, and a download is a navigation
+     * rather than a cross-site request. A redirect is not followed either — the
+     * one origin this app trusts is the one it pinned, and a redirect is how a
+     * request leaves it with the cookie still attached.
+     *
+     * <p>Fetched here rather than through {@code DownloadManager} for the same
+     * two reasons: the cleartext exception this app has is for loopback in *this*
+     * process, and the file this writes is this app's own insert into Downloads
+     * rather than a request another process performs on its behalf.
+     */
+    private void save(String url, String name, String mimetype, String cookie, String agent) {
+        HttpURLConnection connection = null;
+        InputStream in = null;
+        String place = null;
+        String failure = null;
+        try {
+            connection = (HttpURLConnection) new URL(url).openConnection();
+            connection.setInstanceFollowRedirects(false);
+            connection.setConnectTimeout(15000);
+            connection.setReadTimeout(60000);
+            if (cookie != null && !cookie.isEmpty()) {
+                connection.setRequestProperty("Cookie", cookie);
+            }
+            if (agent != null && !agent.isEmpty()) {
+                connection.setRequestProperty("User-Agent", agent);
+            }
+            int status = connection.getResponseCode();
+            if (status < 200 || status > 299) {
+                throw new IOException("HTTP " + status);
+            }
+            in = connection.getInputStream();
+            place = store(name, mimetype, in);
+        } catch (IOException e) {
+            failure = message(e);
+        } catch (RuntimeException e) {
+            failure = message(e);
+        } finally {
+            close(in);
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+        final String where = place;
+        final String why = failure;
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (why == null) {
+                    toast(getString(R.string.download_saved, where));
+                } else {
+                    toast(getString(R.string.download_failed, why));
+                }
+            }
+        });
+    }
+
+    /**
+     * Put the bytes where the user can find them.
+     *
+     * <p>From Android 10 the public Downloads collection takes an app's own
+     * inserts without any permission, so the file appears in the Downloads folder
+     * with everything else and the system file manager lists it — and the app
+     * still asks for no storage permission at all. Before Android 10 the only
+     * writable place without WRITE_EXTERNAL_STORAGE is this app's own external
+     * directory, so that is where it goes and the path is what the message says.
+     */
+    private String store(String name, String mimetype, InputStream in) throws IOException {
+        if (Build.VERSION.SDK_INT >= 29) {
+            return storeInDownloads(name, mimetype, in);
+        }
+        return storeInAppDir(name, in);
+    }
+
+    /** API 29+: the Downloads collection, written through the media store. */
+    private String storeInDownloads(String name, String mimetype, InputStream in) throws IOException {
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+        values.put(MediaStore.MediaColumns.MIME_TYPE,
+                mimetype == null || mimetype.isEmpty() ? "application/octet-stream" : mimetype);
+        values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+        // IS_PENDING keeps a half-written file out of the gallery and out of a
+        // file manager's listings until it is complete.
+        values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+        Uri item = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        if (item == null) {
+            throw new IOException("no Downloads collection");
+        }
+        try {
+            OutputStream out = getContentResolver().openOutputStream(item);
+            if (out == null) {
+                throw new IOException("no output stream");
+            }
+            try {
+                copy(in, out);
+            } finally {
+                close(out);
+            }
+        } catch (IOException e) {
+            // A failed download leaves no empty entry behind for the user to find.
+            getContentResolver().delete(item, null, null);
+            throw e;
+        }
+        values.clear();
+        values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+        getContentResolver().update(item, values, null, null);
+        return getString(R.string.downloads_folder, name);
+    }
+
+    /** Before API 29: this app's own external files directory, path and all. */
+    private String storeInAppDir(String name, InputStream in) throws IOException {
+        File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        if (dir == null) {
+            dir = new File(getFilesDir(), "download");
+        }
+        if (!dir.isDirectory() && !dir.mkdirs()) {
+            throw new IOException("cannot create " + dir);
+        }
+        File file = new File(dir, name);
+        FileOutputStream out = new FileOutputStream(file);
+        try {
+            copy(in, out);
+        } finally {
+            close(out);
+        }
+        return file.getAbsolutePath();
+    }
+
+    private static void copy(InputStream in, OutputStream out) throws IOException {
+        byte[] buffer = new byte[64 * 1024];
+        int read;
+        while ((read = in.read(buffer)) > 0) {
+            out.write(buffer, 0, read);
+        }
+        out.flush();
+    }
+
+    private static String message(Exception e) {
+        return e.getMessage() == null ? e.toString() : e.getMessage();
+    }
+
+    private static void close(Closeable stream) {
+        if (stream == null) {
+            return;
+        }
+        try {
+            stream.close();
+        } catch (IOException e) {
+            // Closing a stream that already failed: the failure is what matters.
         }
     }
 
