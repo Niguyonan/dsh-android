@@ -405,12 +405,28 @@ else
     # phone, where it is the only place the cost shows up.
     sh "$BUILD" --out "$TMP/out/sign-a.apk" --no-payload >/dev/null 2>&1
     sh "$BUILD" --out "$TMP/out/sign-b.apk" --no-payload >/dev/null 2>&1
+    # Only the digest is read, never the label in front of it: that label is
+    # build-tools' business and it differs by platform and by which signing
+    # schemes the APK carries — the macOS build-tools here print
+    # "Signer #1 certificate SHA-256 digest:" and the Linux runner's print
+    # "V3.0 Signer: certificate SHA-256 digest:" for the same APK. Anchored to
+    # "^Signer #1", this check found nothing on the runner, and "both builds
+    # agree" passed on two empty strings while the next line said the certificate
+    # was 0 bytes long: the CI job for a release was red for exactly this, and no
+    # local run could see it.
     cert_a=$("$BT/apksigner" verify --print-certs "$TMP/out/sign-a.apk" 2>/dev/null |
-      sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+      sed -n 's/.*certificate SHA-256 digest: *//p' | head -n 1)
     cert_b=$("$BT/apksigner" verify --print-certs "$TMP/out/sign-b.apk" 2>/dev/null |
-      sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+      sed -n 's/.*certificate SHA-256 digest: *//p' | head -n 1)
     check "a second build is signed with the same key as the first" "$cert_a" "$cert_b"
-    check "and the key is a real certificate" "64" "$(printf '%s' "$cert_a" | wc -c | tr -d ' ')"
+    check "and the key is a real certificate" "yes" \
+      "$(printf '%s' "$cert_a" | grep -Eq '^[0-9a-fA-F]{64}$' && echo yes || echo no)"
+    # The two spellings, as literal text, so the next person to touch the parse
+    # has the evidence rather than the story.
+    for label in "Signer #1 certificate SHA-256 digest: " "V3.0 Signer: certificate SHA-256 digest: "; do
+      check "the digest is read from '$label'" "abc123" \
+        "$(printf '%s\n' "${label}abc123" | sed -n 's/.*certificate SHA-256 digest: *//p' | head -n 1)"
+    done
 
     badging=$("$BT/aapt2" dump badging "$APK" 2>/dev/null)
     contains "the package name is the one the manifest claims" "package: name='dev.dshd.app'" "$badging"
