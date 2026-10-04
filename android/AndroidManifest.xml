@@ -19,8 +19,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.dshd.app"
-    android:versionCode="4"
-    android:versionName="0.1.3">
+    android:versionCode="5"
+    android:versionName="0.1.4">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
 
