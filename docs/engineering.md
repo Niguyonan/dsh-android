@@ -46,10 +46,10 @@ that rootfs, so there is **no native code to rebuild and no fork to maintain**.
 ┌─ WebView APK (android/) ─────────────────────────────────────────────────┐
 │  Does all of the above. There is no terminal step and no script to run by │
 │  hand: one root command per action, and never a shell left open.          │
-│    su -c '… tar -xf - … && exec sh …/bootstrap.sh setup --app-uid N'      │
-│  with payload.tar on stdin: bootstrap.sh verifies every file by digest,   │
-│  installs it, then hands over to `dshd setup`, which streams the ##dshd   │
-│  progress protocol the app renders.                                       │
+│    su -c '… tar -xf - … && exec sh …/bootstrap.sh --from "$S" setup …'    │
+│  with payload.tar on stdin: the tar fills the stage, the bootstrap        │
+│  verifies every file in it by digest, installs it, then hands over to     │
+│  `dshd setup`, whose `##dshd` lines are the protocol the app renders.     │
 │  Activity: WebView → http://127.0.0.1:3081, navigable nowhere else        │
 │  Foreground service: for the length of a run, because a 1 GB download     │
 │  must survive the user switching apps. The server itself is a detached    │
@@ -206,13 +206,14 @@ reported rather than refused); and that `Protocol.java`, which is
 plain Java on purpose, renders the real `dshd`'s output correctly, including
 refusing a run that says `done ok` and then exits non-zero.
 
-**What still needs a device, for the app specifically:** whether Magisk,
-KernelSU and KernelSU-Next forward stdin to `su -c` (the payload arrives that
-way), what their root prompts look like and how they answer a refusal, whether
-the WebView's cookie store survives the way the guard's login needs it to, and
-whether a detached `setsid` supervisor outlives both the app being swiped away
-and a force-stop. Those are Gate P4/P5 rows, and
-[`docs/runbook.md`](runbook.md) is the procedure — including the list of
+**What still needs a device, for the app specifically:** what Magisk's and
+KernelSU's root prompts look like and how they answer a refusal (KernelSU-Next's
+was answered on a Xiaomi/HyperOS device running Android 16, and it *does* forward
+stdin to `su -c` — the payload arrives that way, which the hand-over above now
+depends on rather than assumes), whether the WebView's cookie store survives the
+way the guard's login needs it to, and whether a detached `setsid` supervisor
+outlives both the app being swiped away and a force-stop. Those are Gate P4/P5
+rows, and [`docs/runbook.md`](runbook.md) is the procedure — including the list of
 everything in this stack that has never been executed on real hardware.
 
 **Root solutions:** the stack is written against uid 0 plus a working `su` rather
@@ -352,6 +353,130 @@ that a device would have blamed on Android:
   mode cases in `tests/payload.test.sh` use the real filesystem with only `id` and
   the owner stubbed — a stubbed `stat` would have agreed with whatever the script
   believed, which is exactly how this reached a phone.
+- **The mode check read its own arithmetic in the wrong base.** The entry above
+  fixed the directory the app had created and shipped a bootstrap that closes a
+  mode it can close — and the same screen came back from a phone with the
+  opposite sentence: `/data/local/dsh is mode 700 and the group or other write
+  bits could not be closed on it`, over a directory that had no write bits to
+  close. The mode tests were `$((mode & 022))`, and what a number with a leading
+  zero *means* is the shell's decision, not the script's: 448 to dash and bash,
+  700 to the sh Android runs — mksh's, or toybox sh's, depending on the device —
+  whose arithmetic reads it as decimal. `0700 & 022` is 0 under the first and 20
+  under the second, and 20 is nonzero, so *every* existing install directory was
+  refused, including the 0700 one the app had just created correctly. The
+  documented recovery could not work either: `rm -rf /data/local/dsh` followed by
+  **Set up** recreated it 0700, and it was refused again. The suite ran its mode
+  cases under this host's `sh`, where the script's arithmetic happens to agree
+  with the shell's, so nothing here could fail. The mode is now handled as digits
+  rather than as a number, the cases also run under a shell that reads leading
+  zeros as decimal — asked rather than assumed, since macOS's `/bin/ksh` answers
+  448 — and a lint keeps a leading-zero literal out of anything the shell
+  computes, on every host. Reading a manifest line into a variable named `path`
+  was the same class of trap one step away: zsh and ksh93 tie `path` to `PATH`, so
+  the digest step reported that the device had no `sha256sum` at all. Android's sh
+  does not tie them (checked on the device), and the variable is `file` now.
+- **Two readers, one stream.** The app's command extracts the payload into
+  `/data/local/dsh/.stage` — it has to, because the thing it runs next is
+  `bootstrap.sh` inside that archive — and the bootstrap, given no other source,
+  extracted the payload *again* from its own stdin. There is one payload stream
+  and `tar` reads it to the end, so the second extraction read an empty pipe:
+  `tar: Not tar`, "the payload did not extract", exit 6, `fail payload`. Every
+  host test drove the bootstrap with the archive on stdin — the flow that works —
+  and nothing drove the command the app actually sends, so this waited for the
+  first device run that got past the install directory. It needed to *get* past
+  it, which is the entry above, which is why the two arrived together. The app now
+  passes `--from "$S"`, the bootstrap verifies that stage like any other source
+  (nothing is trusted for having been unpacked by the app), and the suite runs the
+  app's command in the app's order — tar first, payload on the stdin of the whole
+  pipeline, `--from` omitted afterwards as the failure it is. On the device this
+  also answered a question this file had left open: KernelSU-Next does forward
+  stdin to `su -c`, since the first `tar` received all 215 KB of the payload and
+  ran `bootstrap.sh` out of it.
+- **A query was judged by the rule for an install.** With the hand-over fixed, the
+  phone's payload installed — `9 files verified, 9 updated` — and its screen then
+  said "Setup stopped — the setup stopped without saying why (exit 3)". The app
+  judges a run by two signals, `done ok` and exit 0, which is right for `setup`:
+  it is the only verb that says `done ok`. `dshd setup --check` is a *query* — it
+  reports what is installed and what is running on its `info` lines, and exits 3,
+  "not running", when the answer is that nothing is set up yet. Judged as an
+  install, every answer it can give reads as a failure: a fresh device showed the
+  sentence above above a header that already said "Not set up", and a healthy
+  device, whose check exits 0, showed it with a 0 in it. Success for `check` is
+  now "the device answered" — an `info` line, no named failing step, and the
+  query's own 0 or 3 — and it is deliberately narrow: a check that named a failed
+  step, could not run for lack of root, or answered nothing is still a failure.
+  The cases are driven with the bytes the phone actually wrote.
+- **The file name discovery returned its own log line.** With the check screen
+  honest, `SET UP` ran and stopped at *Installing the Linux system* with exit 4:
+  `curl: (3) URL rejected: Malformed input to a URL function`, then BusyBox
+  `wget: server returned error: HTTP/1.1 400 Bad Request`, then "cannot download
+  https://…/release/". The step blamed the network, and the network was fine. The
+  URL being fetched was
+
+      https://…/release/2026-10-04T12:31:11+0800 rootfs-setup: fetching https://…/release/
+      ubuntu-base-24.04.5-base-arm64.tar.gz
+
+  — a URL with a timestamp and a newline in it, because `discover_base_file`
+  returns a file name on stdout, the caller captures stdout with `$( )`, and
+  `fetch` logs the URL it is about to read on stdout too. One `>&2` fixes it, and
+  the reason is written where the next person will look. No test had ever run
+  discovery: every case in `tests/rootfs-setup.test.sh` handed the script a local
+  tarball with `--base-file`, so the one path that reads a listing — the path a
+  device takes — was unexercised. It has a case now, with the network stubbed by a
+  `curl` that answers by destination and a listing that puts the *lexically*
+  smaller point release first, so "newest" cannot be an accident of order.
+- **A presence check that failed when *either* path was absent.** With the base
+  image installed, the harness step stopped at exit 3 with
+
+      install-harness: WARNING: missing: libstdc++.so.6 — the eager native load on the boot path needs it
+      install-harness: installing libstdc++6 from the distro
+      libstdc++6 is already the newest version (14.2.0-4ubuntu2~24.04.1).
+      install-harness: ERROR: libstdc++6 still does not resolve after installing it
+
+  The check was `ls /usr/lib/*/libstdc++.so.6* /usr/lib/libstdc++.so.6* >/dev/null
+  2>&1`, and `ls` exits non-zero when *any* operand is missing: on the Ubuntu
+  base a device installs, the library lives only under the multiarch triplet the
+  first pattern covers, so ls listed the file and failed on the second pattern
+  anyway. A rootfs that had the library was told it did not resolve, and apt — run
+  because of that — answered that it was already installed. Each pattern is asked
+  about on its own now, and from *outside* the chroot (`"$DSH_ROOTFS"/usr/lib/…`),
+  which is also what makes it testable: a pattern a shell inside the chroot
+  expands is a pattern no host-side test can arrange. That untestability is the
+  second half of this entry — every case in `tests/install-harness.test.sh` passed
+  `--skip-libs`, so `check_libs` had never run anywhere, and the new case runs it
+  in both directions: the library under the triplet (found), and no library at all
+  (still refused).
+- **A second `SET UP` failed on its own successful install.** With the harness
+  installed and running — `install-harness.sh` had put 0.2.0-rc.2 in the rootfs —
+  re-running setup stopped at *Installing the harness* with exit 5:
+  "the harness is already installed in this rootfs (version 0.2.0-rc.2). Re-run
+  with `--force`". The refusal itself is deliberate (a working install is not
+  clobbered without being asked), but it was fatal for *any* installed version,
+  including the pin, and the rootfs step one screen earlier skips in exactly that
+  case: one run reported "skip" for the base and "fail" for the harness, over the
+  same state. Preflight now tells the two cases apart — the pinned version already
+  present means nothing to install, a *different* version present is still a
+  refusal — and the install and the manifest are skipped while verification and
+  the smoke test still run, which is what makes skipping them honest. The suite
+  covers both versions of the case.
+- **The screen offered START for a device that was half installed.** `dshd setup
+  --check` reports `installed` (rootfs and Node) and `harness` (the harness's own
+  `dsh`) separately, because a run can leave the first and not the second: the
+  device above answered `installed yes`, `harness no`. Keyed on `installed` alone,
+  the app said "the harness is installed but not running" and offered START —
+  which refused, correctly, with "harness not installed at
+  …/usr/local/bin/dsh". Ready is now both halves, in the status line, the panel,
+  both buttons and the autostart toggle. The refusal was right; the button was not.
+- **The debug build could not be installed over the previous one.** `android/build.sh`
+  wipes `$BUILD` at the start of every build, and the debug keystore it generates
+  lived inside it — so every build signed with a new key, and installing the
+  result over the last one failed with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`: an
+  uninstall, the app's preferences, and the root grant asked for again. Found by
+  rebuilding to verify a fix on a phone, which is the only place the cost lands on
+  a person. The keystore now lives beside the build directory (`android/.debug.keystore`,
+  already gitignored), a keystore left inside an old build directory is adopted
+  rather than orphaned, and a case in `tests/apk.test.sh` builds twice and compares
+  the certificates.
 
 ## Corrections to the plan found while implementing
 

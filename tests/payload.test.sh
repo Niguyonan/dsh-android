@@ -17,6 +17,12 @@
 #     — ends in exit 7 with nothing installed, and with `fail base` on the
 #     protocol so the app can say which check refused instead of blaming the
 #     payload
+#   * those same modes under a shell whose arithmetic reads a leading zero as
+#     decimal, which is what the sh on a phone does: `$((0700 & 022))` is 0 to
+#     dash and bash and 20 to that shell, and 20 is nonzero — so a 0700 install
+#     directory with no write bits to close was refused as writable by another
+#     uid on a phone while every mode case below, run under this host's sh,
+#     passed. A lint keeps the rest of the class out
 #   * a truncated transfer and a tampered file both end in exit 6 with nothing
 #     installed, rather than a half-installed tree that mostly works
 #   * the payload id is content-addressed: same tree, same id; changed byte,
@@ -165,7 +171,17 @@ stub_root_owner() { write_root_stub "$TMP/bin-root"; }
 run_bootstrap_real() {
   base=$1
   shift
-  cat "$ASSETS/payload.tar" | PATH="$TMP/bin-root:$PATH" DSH_BASE="$base" sh "$BOOT" "$@" 2>&1
+  run_bootstrap_real_shell sh "$base" "$@"
+}
+
+# The same, under a shell this suite names. Reading a mode is a property of the
+# shell doing the arithmetic rather than of the tree, so the cases below have to
+# be runnable under more than one.
+run_bootstrap_real_shell() {
+  shell=$1
+  base=$2
+  shift 2
+  cat "$ASSETS/payload.tar" | PATH="$TMP/bin-root:$PATH" DSH_BASE="$base" "$shell" "$BOOT" "$@" 2>&1
 }
 
 host_mode() {
@@ -349,6 +365,59 @@ out=$(run_bootstrap "$BASE" "$HANDOFF")
 contains "a second run updates nothing" "0 updated" "$out"
 contains "a second run keeps every file" "9 unchanged" "$out"
 
+# --- the hand-over the app issues -------------------------------------------
+#
+# Every case above pipes the payload into the bootstrap, which is how this suite
+# has always driven it — and it is not what the app does. The app's command runs a
+# `tar` first, because it needs a bootstrap.sh on the device to execute, and that
+# tar reads stdin to the end. A bootstrap then left to extract the payload itself
+# reads an empty stream and stops the whole setup at exit 6, after a first run
+# that had reached it: it happened on a phone before it happened here, and the
+# phone's log named the line (`tar: Not tar`). So this case runs the command in
+# the app's order, payload on the stdin of the whole pipeline, and keeps the
+# without-the-flag version beside it as the failure it is.
+
+printf '\n== the hand-over the app issues ==\n'
+
+# The root stub, because this case runs the command as the app does — and the
+# install-directory cases that build it come later in this file. Writing it twice
+# is the same stub.
+stub_root_owner
+
+# Shaped like Shell.bootstrapCommand: one command, tar first, bootstrap second.
+app_command() {
+  base=$1
+  shift
+  cat "$ASSETS/payload.tar" | PATH="$TMP/bin-root:$PATH" DSH_BASE="$base" sh -c \
+    "S=\"$base/.stage\"; rm -rf \"\$S\"; (umask 077; mkdir -p \"\$S\") && tar -xf - -C \"\$S\" && exec sh \"\$S/bootstrap.sh\" --from \"\$S\" \"\$@\"" \
+    handover "$@" 2>&1
+}
+
+APP="$TMP/app-base"
+out=$(app_command "$APP" "$HANDOFF")
+rc=$?
+check "the app's command, tar first, installs and hands over" "0" "$rc"
+contains "and verifies the stage the tar filled" "payload verified: 9 files" "$out"
+check "and leaves the runtime where it runs it from" "yes" \
+  "$([ -x "$APP/bin/dshd" ] && echo yes || echo no)"
+lacks "and never reports an empty stream" "did not extract" "$out"
+
+# The same command with the flag removed — what the app used to send. The stage
+# holds the payload and the bootstrap deletes it, which a shell reading its own
+# script survives; what it cannot survive is finding nothing on stdin. Which
+# refusal comes out of that is the tar's to choose — the phone's toybox said
+# `tar: Not tar` and "the payload did not extract"; BSD tar here takes an empty
+# stream and the manifest check refuses instead — so this asserts what does not
+# vary: exit 6, and nothing installed.
+APP_NOFROM="$TMP/app-nofrom"
+out=$(cat "$ASSETS/payload.tar" | PATH="$TMP/bin-root:$PATH" DSH_BASE="$APP_NOFROM" sh -c \
+  "S=\"$APP_NOFROM/.stage\"; rm -rf \"\$S\"; (umask 077; mkdir -p \"\$S\") && tar -xf - -C \"\$S\" && exec sh \"\$S/bootstrap.sh\" \"\$@\"" \
+  handover "$HANDOFF" 2>&1)
+rc=$?
+check "without the flag the same command exits 6" "6" "$rc"
+contains "and is attributed to the payload step" "##dshd pre fail payload" "$out"
+check "and installs nothing" "no" "$([ -e "$APP_NOFROM/bin" ] && echo yes || echo no)"
+
 # --- bootstrap: tampering ---------------------------------------------------
 
 printf '\n== bootstrap refuses a bad payload ==\n'
@@ -450,6 +519,120 @@ rc=$?
 check "a base that does not exist is created" "0" "$rc"
 check "and created 0700" "700" "$(host_mode "$REALN")"
 contains "and it says so" "created $REALN, mode 700" "$out"
+
+# --- bootstrap: the shell's arithmetic --------------------------------------
+#
+# What a number with a leading zero means is the shell's decision: 0700 is 448 to
+# dash and bash and 700 to the sh Android ships, whose arithmetic reads it as
+# decimal, and `$((0700 & 022))` is 0 under the first and 20 under the second. The
+# mode cases above ran green while a phone refused its own install directory —
+# mode 700, no write bits to close — as writable by another uid, exit 7, on the
+# one path that has no terminal to see why from.
+#
+# So the regression is a shell, not a stub: whichever shell on this host reads
+# 0700 as 700 runs the same real cases against real directories. zsh does it
+# wherever macOS ships one; mksh — the shell the phone actually runs — and ksh93
+# do it where they are installed. With none of them here the suite says so rather
+# than reporting a pass it did not earn, and the lint below still runs.
+
+printf '\n== bootstrap under a shell that reads 0700 as decimal ==\n'
+
+decimal_shell() {
+  for candidate in "${TEST_DECIMAL_SHELL:-}" zsh mksh ksh93; do
+    [ -n "$candidate" ] || continue
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    # Asked, not assumed: the same name is octal on one build and decimal on
+    # another — macOS's /bin/ksh answers 448 here — so a name is no reason to
+    # believe anything about the arithmetic.
+    [ "$("$candidate" -c 'printf %s "$((0700))"' 2>/dev/null)" = 700 ] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+DEC_SHELL=$(decimal_shell) || DEC_SHELL=""
+if [ -z "$DEC_SHELL" ]; then
+  skip "a 0700 base survives an arithmetic that reads leading zeros as decimal" \
+    "no such shell on this host (tried zsh, mksh, ksh93; TEST_DECIMAL_SHELL overrides)"
+else
+  printf '     (%s reads 0700 as 700)\n' "$DEC_SHELL"
+
+  DEC0="$TMP/dec-real-700"
+  mkdir -p "$DEC0"
+  chmod 700 "$DEC0"
+  out=$(run_bootstrap_real_shell "$DEC_SHELL" "$DEC0" "$HANDOFF")
+  rc=$?
+  check "a 0700 base is accepted, not refused" "0" "$rc"
+  contains "and the base step reports ok" "##dshd pre ok base" "$out"
+  lacks "and nothing is said about write bits it does not have" \
+    "could not be closed" "$out"
+  check "and the payload is installed through it" "yes" \
+    "$([ -x "$DEC0/bin/dshd" ] && echo yes || echo no)"
+
+  DEC1="$TMP/dec-real-775"
+  ( umask 002; mkdir -p "$DEC1" )
+  out=$(run_bootstrap_real_shell "$DEC_SHELL" "$DEC1" "$HANDOFF")
+  rc=$?
+  check "a 0775 base is still fixed rather than refused" "0" "$rc"
+  check "and ends up 0700" "700" "$(host_mode "$DEC1")"
+  contains "and it says what the mode was" "was mode 775" "$out"
+
+  # And the case the read-back exists for still fails closed under that shell: a
+  # chmod that closes nothing, on a directory that needs it.
+  DEC2="$TMP/dec-real-nofix"
+  ( umask 002; mkdir -p "$DEC2" )
+  write_root_stub "$TMP/bin-dec-nochmod"
+  printf '#!/bin/sh\nexit 1\n' >"$TMP/bin-dec-nochmod/chmod"
+  chmod 755 "$TMP/bin-dec-nochmod/chmod"
+  out=$(cat "$ASSETS/payload.tar" | PATH="$TMP/bin-dec-nochmod:$PATH" DSH_BASE="$DEC2" \
+    "$DEC_SHELL" "$BOOT" "$HANDOFF" 2>&1)
+  rc=$?
+  check "a mode that will not close still exits 7 under it" "7" "$rc"
+  contains "and says the write bits could not be closed" "could not be closed" "$out"
+  check "and installs nothing" "no" "$([ -e "$DEC2/bin" ] && echo yes || echo no)"
+fi
+
+# --- bootstrap: leading-zero numbers, the class ------------------------------
+#
+# The cases above catch this instance on a host that has such a shell. This is
+# the class, and it holds on every host: in the shell the payload runs, a number
+# with a leading zero may not appear where the shell computes its value — inside
+# `$(( ))`, or on the right of a numeric test — because the value then depends on
+# which shell is reading it. The lint is itself tested against a planted
+# counter-example, because a check that cannot fail is not a check.
+
+printf '\n== no leading-zero numbers where the shell computes ==\n'
+
+leading_zero_numbers() {
+  # A line that is nothing but a comment is dropped before the answer is read:
+  # the comments in these files quote the very expression this looks for, because
+  # explaining why it may not be used is the point of them. A trailing comment is
+  # not dropped — the code in front of it still runs — and the line numbers are
+  # the file's own, because the filter runs on `grep -n`'s output rather than
+  # before it.
+  grep -nE '\$\(\([^)]*[^0-9A-Za-z_]0[0-9]|-(eq|ne|lt|gt|le|ge) 0[0-9]' "$1" |
+    grep -vE '^[0-9]+:[[:space:]]*#'
+}
+
+printf '[ $((mode & 022)) -eq 0 ]\n' >"$TMP/lint-arith"
+printf '[ "$mode" -eq 0700 ]\n' >"$TMP/lint-test"
+printf '[ $((mode & 22)) -eq 0 ] && [ "$mode" -eq 700 ]\n' >"$TMP/lint-clean"
+counted() { leading_zero_numbers "$1" | grep -c . || true; }
+check "the lint flags a leading-zero mask" "1" "$(counted "$TMP/lint-arith")"
+check "the lint flags a leading-zero number in a test" "1" "$(counted "$TMP/lint-test")"
+check "and is quiet about decimal arithmetic" "0" "$(counted "$TMP/lint-clean")"
+
+# The files it lints are the payload's own, taken from mkpayload.sh's list rather
+# than repeated here: the thing that must not carry this is what root installs.
+linted=0
+for src in $(sed -n '/^MANIFEST_FILES="/,/^"$/p' "$MK" | awk 'NF==3 { print $2 }' | grep -v '\.mjs$'); do
+  linted=$((linted + 1))
+  hits=$(leading_zero_numbers "$REPO/$src")
+  [ -z "$hits" ] || fail "no leading-zero number in $src" "$hits"
+done
+check "and the lint ran over every shell file the payload ships" "yes" \
+  "$([ "$linted" -ge 8 ] && echo yes || echo "no ($linted files)")"
 
 printf '\n== bootstrap refuses what it cannot fix ==\n'
 

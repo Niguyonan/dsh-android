@@ -262,6 +262,82 @@ public final class Protocol {
             return exitCode.intValue() == 0 && doneOk.booleanValue();
         }
 
+        /**
+         * Whether a {@code check} run answered the question it was asked.
+         *
+         * <p>{@code dshd setup --check} is a query, not an install. It reports
+         * what is on the device on its {@code info} lines, and it exits 3 — "not
+         * running", the code the runbook documents — when the answer is that
+         * nothing is set up yet. The two-signal rule in {@link #succeeded()}
+         * belongs to {@code setup}, the only verb that says {@code done ok}, and
+         * applied to a query it made *both* answers read as failures on a real
+         * screen: a device that had never been set up showed "Setup stopped — the
+         * setup stopped without saying why (exit 3)", and a healthy one, whose
+         * check exits 0, showed the same sentence with a 0 in it. An app that
+         * opens on either is telling its user something is broken when the header
+         * above the sentence already said "Not set up".
+         *
+         * <p>Success here means "the device answered", and the answer is on the
+         * info lines whichever way the query came out. It is deliberately narrow:
+         * a check that named a step that failed, that could not run for lack of
+         * root, or that exited with anything but the query's own 0 or 3 is still
+         * a failure, and a check that answered nothing at all is one too.
+         */
+        public boolean answeredCheck() {
+            if (failStep != null || exitCode == null) {
+                return false;
+            }
+            int code = exitCode.intValue();
+            if (code != 0 && code != 3) {
+                return false;
+            }
+            return !info.isEmpty();
+        }
+
+        /**
+         * {@link #succeeded()} for the verb that ran: the same judgement for
+         * everything that installs, and {@link #answeredCheck()} for the query.
+         */
+        public boolean succeeded(String verb) {
+            if ("check".equals(verb)) {
+                return answeredCheck();
+            }
+            if (verb == null || "setup".equals(verb)) {
+                return succeeded();
+            }
+            // Every other verb the app sends is a question or a single action —
+            // start, stop, restart, boot, status, url, logs, token, mounts — and
+            // dshd answers those with its exit status and its own output; `done
+            // ok` is this protocol's completion for `setup`, the one verb that
+            // installs something and can therefore be interrupted half-done. Judged
+            // by the setup rule, a device that was running perfectly — supervisor,
+            // harness and guard up, both ports listening — read "Setup stopped —
+            // the setup stopped without saying why (exit 0)" after a start.
+            return failStep == null && exitCode != null && exitCode.intValue() == 0;
+        }
+
+        /**
+         * {@link #failureReason()} for the verb that ran, or null when that verb
+         * got what it asked for.
+         */
+        public String failureReason(String verb) {
+            if (succeeded(verb)) {
+                return null;
+            }
+            String why = failureReason();
+            // Every specific diagnosis stands — a step that named itself, a
+            // refusal to grant root, a payload that did not verify, an install
+            // directory that is not safe. Only the sentence for a run that said
+            // nothing at all names the verb instead: "the setup stopped without
+            // saying why" is not what happened when `start` refused, and the
+            // reason it refused is on the log's stderr lines for whoever opens it.
+            if (verb != null && !"setup".equals(verb) && why != null
+                    && why.startsWith("the setup stopped without saying why")) {
+                return verb + " exited " + exitCode.intValue();
+            }
+            return why;
+        }
+
         /** Why this run is not a success, in one line, or null when it is one. */
         public String failureReason() {
             if (succeeded()) {
@@ -318,9 +394,15 @@ public final class Protocol {
         // assumed. Without it the run reads as "did not finish", which is the
         // honest answer when nobody said otherwise.
         Integer exit = null;
+        String verb = null;
         for (int i = 0; i + 1 < args.length; i++) {
             if ("--exit".equals(args[i])) {
                 exit = Integer.valueOf(args[i + 1]);
+            }
+            // The verb, because the judgement depends on it: `check` asks a
+            // question and `setup` does the work. See succeeded(String).
+            if ("--verb".equals(args[i])) {
+                verb = args[i + 1];
             }
         }
         java.io.BufferedReader in =
@@ -346,7 +428,7 @@ public final class Protocol {
             System.out.println("step  | " + s.name + " state=" + s.state + " msg=" + s.message);
         }
         System.out.println("url=" + state.url);
-        System.out.println("done=" + state.doneOk + " ok=" + state.succeeded()
-                + " reason=" + state.failureReason());
+        System.out.println("verb=" + verb + " done=" + state.doneOk + " ok=" + state.succeeded(verb)
+                + " reason=" + state.failureReason(verb));
     }
 }

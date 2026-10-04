@@ -140,6 +140,7 @@ close. It reports each case on the protocol, with the reason, as `fail base`:
 | What it finds | What it does |
 |---|---|
 | A mode that is not 0700, owned by root | closes it to 0700 and says so in the log (`was mode 0775; it is mode 0700 now`). This is what an install directory created by an older build looks like |
+| A mode that is *already* 0700, in the log as `mode 0700 and the group or other write bits could not be closed` | nothing is wrong with the device: that was a defect in the payload, where the mode test was `$((mode & 022))` and `0700` is decimal to the sh Android runs, so a directory with no write bits to close looked writable. Builds with the fix do not print this; `rm -rf /data/local/dsh` did not help, because the next run created it 0700 again |
 | Owned by another uid | refuses (exit 7): that uid would decide what root runs |
 | A symlink in its place, or an install directory inside it (`bin`, `tools`, `guard`, `boot/service.d`) that is one | refuses (exit 7): root would write wherever it points |
 
@@ -308,6 +309,29 @@ description of something observed:
 - `xt_owner` in this device's kernel, `noexec` on the target path, SELinux policy
   for `mount` from a `su` context, devpts/PTY behaviour, and whether a detached
   `setsid` supervisor survives a force-stop.
+
+**Since added, from one device:** a Xiaomi tablet on Android 16 with
+KernelSU-Next (`com.rifsxd.ksunext`) rendered the APK's UI, answered the root
+prompt, and ran the app's `su -c` command through a **complete setup**: the
+payload verified and installed by digest, the Ubuntu base and the pinned Node
+downloaded and checksummed, `@deepseek-ai/dsh@0.2.0-rc.2` installed with npm
+inside the chroot, the posture recorded, and the server started —
+`supervisor: running`, `harness: running …, port 3080 listening`, `guard: running
+…, port 3081 listening`, `harness: 0.2.0-rc.2`, the app's status line reading
+**Running**, and the harness UI answering a prompt in the app's window. Eight
+defects in this repository surfaced doing it, each in a path only a device ran:
+they are the entries at the end of
+[`engineering.md`](engineering.md#defects-the-host-tests-caught-and-what-they-cost-on-a-device).
+What the run confirms about the device, rather than about this repository:
+KernelSU-Next forwards stdin to `su -c`; `su` is not on `PATH` for an app that has
+not been granted (the probe reports `no su binary answered`, not exit 2); the su
+context carries BusyBox applets, which is why the payload's `wget` path is the
+BusyBox one; and the kernel has **no Landlock**, so the app shows its sandbox
+warning — "no landlock: the agent is NOT confined to the workspace" — with the
+harness running anyway, which is the documented behaviour for a device without it
+([`security.md`](security.md)). Still unverified here: whether the server survives
+a reboot, a swipe-away and a force-stop (P4 row), and what the firewall rule looks
+like from another app's side once it is in force.
 
 Everything in that list is a row in `docs/phase-0-probe-ledger.md` or a gate
 above. Fill them in on the device you care about, and this file becomes a record

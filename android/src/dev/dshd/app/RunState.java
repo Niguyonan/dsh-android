@@ -167,8 +167,11 @@ public final class RunState {
             String reason = fallbackFailure;
             boolean ok = false;
             if (reason == null && finishing) {
-                reason = STATE.failureReason();
-                ok = STATE.succeeded();
+                // Judged by the verb: `setup` has to finish what it started, and
+                // `check` only has to answer. A query is not a failure for
+                // reporting the device it found. See Protocol.answeredCheck().
+                reason = STATE.failureReason(verb);
+                ok = STATE.succeeded(verb);
             }
             return new View(busy, finishing, ok, reason, verb, STATE.url,
                     new LinkedHashMap<String, String>(STATE.info), steps,

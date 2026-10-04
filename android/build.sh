@@ -51,8 +51,8 @@ RES="$HERE/res"
 MANIFEST="$HERE/AndroidManifest.xml"
 
 PKG=dev.dshd.app
-VERSION_NAME=0.1.1
-VERSION_CODE=2
+VERSION_NAME=0.1.2
+VERSION_CODE=3
 OUT=""
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
 KEYSTORE="${DSH_KS_FILE:-}"
@@ -60,6 +60,15 @@ KS_PASS="${DSH_KS_PASS:-android}"
 KS_ALIAS="${DSH_KS_ALIAS:-dshd}"
 DEBUG_SIGNED=0
 WITH_PAYLOAD=1
+
+# The generated debug keystore lives *beside* the build directory, not inside it.
+# $BUILD is wiped at the start of every build, so a keystore kept there is a new
+# key every time — which signs each APK with a different certificate, so the
+# second build cannot be installed over the first. On a device that is
+# INSTALL_FAILED_UPDATE_INCOMPATIBLE, an uninstall, and a root grant asked for
+# again: found by rebuilding to verify a fix on a phone, where that is the only
+# place the cost is visible. `*.keystore` is already gitignored.
+DEBUG_KEYSTORE="$HERE/.debug.keystore"
 
 die() {
   rc=$1
@@ -165,6 +174,12 @@ fi
 
 # --- resources and manifest -------------------------------------------------
 
+# A keystore left by a build from before this line is still the key every APK
+# installed from it was signed with: adopt it rather than orphaning them.
+if [ ! -f "$DEBUG_KEYSTORE" ] && [ -f "$BUILD/debug.keystore" ]; then
+  mv "$BUILD/debug.keystore" "$DEBUG_KEYSTORE" || die 3 "cannot keep $BUILD/debug.keystore"
+fi
+
 rm -rf "$BUILD"
 mkdir -p "$BUILD/compiled" "$BUILD/classes" "$BUILD/dex" "$BUILD/gen" || die 3 "cannot create $BUILD"
 
@@ -204,7 +219,7 @@ zip -q -j unsigned.apk dex/classes.dex || die 3 "cannot add classes.dex"
 
 if [ -z "$KEYSTORE" ]; then
   DEBUG_SIGNED=1
-  KEYSTORE="$BUILD/debug.keystore"
+  KEYSTORE="$DEBUG_KEYSTORE"
   if [ ! -f "$KEYSTORE" ]; then
     say "signing:  generating a debug keystore at $KEYSTORE"
     keytool -genkeypair -keystore "$KEYSTORE" -storepass "$KS_PASS" -keypass "$KS_PASS" \

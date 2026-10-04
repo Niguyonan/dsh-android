@@ -75,7 +75,7 @@ SKIP_NODE=0
 SKIP_VERIFY=0
 DRY_RUN=0
 
-BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/$BASE_RELEASE/release"
+BASE_URL="${DSH_BASE_URL:-https://cdimage.ubuntu.com/ubuntu-base/releases/$BASE_RELEASE/release}"
 NODE_URL="https://nodejs.org/dist/$NODE_VERSION"
 
 DOWNLOAD_DIR="$DSH_BASE/download"
@@ -227,9 +227,22 @@ preflight() {
 
 # Discover the newest ubuntu-base-<release>.*-base-<arch>.tar.gz rather than
 # hardcoding a point release that will disappear.
+#
+# What this function prints on stdout is the file name and nothing else, because
+# the caller captures it: `name=$(discover_base_file)`. That is not a style
+# preference. `fetch` logs the URL it is about to read on stdout, so the listing
+# fetch below put its own log line into the name — and the device asked for
+#
+#   https://…/release/2026-10-04T12:31:11+0800 rootfs-setup: fetching https://…/release/
+#   ubuntu-base-24.04.5-base-arm64.tar.gz
+#
+# a URL with a newline in it, which curl refused ("URL rejected: Malformed input
+# to a URL function") and BusyBox wget answered with 400 Bad Request, while the
+# step's error message blamed the network. `>&2` is the whole fix: the log line is
+# still printed, on the stream that is not the return value.
 discover_base_file() {
   listing="$DOWNLOAD_DIR/.listing"
-  fetch "$BASE_URL/" "$listing" || die 4 "cannot list $BASE_URL/ (no network, or no curl/wget)"
+  fetch "$BASE_URL/" "$listing" >&2 || die 4 "cannot list $BASE_URL/ (no network, or no curl/wget)"
   # Compared numerically rather than with `sort -V`, which toybox's sort does not
   # promise: lexically 24.04.10 sorts before 24.04.9, which is exactly the bug
   # that would pin an old point release forever.

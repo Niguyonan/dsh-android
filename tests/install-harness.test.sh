@@ -358,6 +358,28 @@ case_already_installed() {
   check "--force reinstalls" "0" "$?"
   check "and the manifest now names the pin" "0.2.0-rc.2" \
     "$(sed -n 's/^version=//p' "$DSH_ROOTFS/opt/dsh-android/harness.manifest")"
+
+  # And the case the device found: the *pinned* version is already there, which
+  # is the ordinary state of a second `dshd setup`. Fatal for any installed
+  # version, it stopped a re-run at the harness step on a device whose harness
+  # was installed and running, one screen after the rootfs step had skipped for
+  # exactly the same reason. Nothing to install is not a failure; the verify and
+  # smoke phases still run, which is what makes saying so honest.
+  make_env
+  mkdir -p "$DSH_ROOTFS/opt/dsh-android"
+  printf 'version=0.2.0-rc.2\n' >"$DSH_ROOTFS/opt/dsh-android/harness.manifest"
+  : >"$TMP/npm-install.args"
+  out=$(run_install 2>&1)
+  rc=$?
+  check "the pinned version already installed is not a failure" "0" "$rc"
+  contains "and the install says it skipped" "npm install skipped" "$out"
+  contains "and keeps the manifest it found" "manifest kept" "$out"
+  if [ -s "$TMP/npm-install.args" ]; then
+    fail "and npm is not run again" "npm was invoked: $(cat "$TMP/npm-install.args")"
+  else
+    pass "and npm is not run again"
+  fi
+  contains "and the run still verifies what is there" "phase 2d" "$out"
 }
 
 # ===========================================================================
@@ -574,6 +596,39 @@ case_pin_is_documented() {
 }
 
 # ===========================================================================
+# 7. libstdc++, where Ubuntu actually puts it
+# ===========================================================================
+#
+# `check_libs` had never run in this suite at all: every case above passes
+# --skip-libs, so the phase that decides whether the boot path can load its
+# native addon was unexercised here and everywhere else. On a device it decided
+# wrong — `ls /usr/lib/*/libstdc++.so.6* /usr/lib/libstdc++.so.6*` exits non-zero
+# when *either* pattern matches nothing, and on the Ubuntu base the library lives
+# only under the multiarch triplet — so a rootfs that had it (apt: "libstdc++6 is
+# already the newest version") was told it did not resolve, and the install
+# stopped there.
+case_libs_under_multiarch() {
+  make_env
+  mkdir -p "$DSH_ROOTFS/usr/lib/aarch64-linux-gnu"
+  : >"$DSH_ROOTFS/usr/lib/aarch64-linux-gnu/libstdc++.so.6.0.33"
+  out=$(sh "$SETUP" --no-apt 2>&1)
+  rc=$?
+  check "a rootfs with libstdc++ under the triplet reaches the end" "0" "$rc"
+  contains "and the phase says the library is there" "libstdc++ is present" "$out"
+  lacks "and never calls it missing" "missing: libstdc++" "$out"
+
+  # The other direction, which the fix must not have traded away: a rootfs with
+  # no libstdc++ anywhere is still a refusal to hand over a boot path that
+  # cannot load.
+  make_env
+  out=$(sh "$SETUP" --no-apt 2>&1)
+  rc=$?
+  check "a rootfs with no libstdc++ at all exits 3" "3" "$rc"
+  contains "and names the library" "missing: libstdc++" "$out"
+  contains "and says what to do about it" "missing shared libraries and --no-apt was given" "$out"
+}
+
+# ===========================================================================
 
 case_preflight
 case_args
@@ -588,6 +643,7 @@ case_smoke_no_token
 case_skip_smoke_is_loud
 case_dry_run
 case_pin_is_documented
+case_libs_under_multiarch
 
 printf '\n%s run, %s failed, %s skipped\n' "$TESTS_RUN" "$TESTS_FAILED" "$TESTS_SKIPPED"
 [ "$TESTS_FAILED" -eq 0 ] || exit 1

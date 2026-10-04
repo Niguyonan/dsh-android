@@ -70,6 +70,9 @@ SKIP_LIBS=0
 USE_APT=1
 FORCE=0
 DRY_RUN=0
+# Set by preflight when the pinned version is already in the rootfs: the install
+# and the manifest are then nothing to do, and everything after them still runs.
+INSTALL_SKIP=""
 
 ROOTFS_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 NPM_CACHE=/var/cache/dsh-npm
@@ -133,7 +136,19 @@ preflight() {
 
   installed=$(installed_version)
   if [ -n "$installed" ] && [ "$FORCE" != 1 ]; then
-    die 5 "the harness is already installed in this rootfs (version $installed). Re-run with --force to replace it, or use tools/update.sh for a version bump."
+    if [ "$installed" = "$VERSION" ]; then
+      # The pinned version is already in the rootfs: nothing to install, and
+      # nothing to replace either. This used to be fatal for *any* installed
+      # version, which made a second `dshd setup` stop at the harness step on a
+      # device whose harness was installed and running — while the rootfs step
+      # one screen earlier *skips* in exactly this case, so one setup run
+      # reported "skip" and "fail" for the two halves of the same state. The
+      # verification and the smoke test below still run: a re-run is where those
+      # earn their keep, and they are what makes skipping the install honest.
+      INSTALL_SKIP="the pinned $VERSION is already installed"
+    else
+      die 5 "the harness is already installed in this rootfs (version $installed). Re-run with --force to replace it, or use tools/update.sh for a version bump."
+    fi
   fi
 }
 
@@ -173,9 +188,25 @@ missing_libs() {
   # The addons on the boot path declare DT_NEEDED on libstdc++.so.6, which a
   # minimal Ubuntu base does not ship. libgcc_s and libutil come with libgcc-s1
   # and libc6 respectively, so they are not checked separately.
-  if in_rootfs /bin/sh -c "ls /usr/lib/*/libstdc++.so.6* /usr/lib/libstdc++.so.6* >/dev/null 2>&1"; then
-    return 0
-  fi
+  #
+  # Each pattern is asked about on its own, and that is a fix rather than a
+  # style. `ls /usr/lib/*/libstdc++.so.6* /usr/lib/libstdc++.so.6*` exits
+  # non-zero when *either* pattern matches nothing, and on the Ubuntu base a
+  # device installs, the library lives only under the multiarch triplet that the
+  # first pattern covers: ls listed the file and failed on the second pattern
+  # anyway, this function called the library missing, apt answered "libstdc++6
+  # is already the newest version", and the run died with "libstdc++6 still does
+  # not resolve after installing it" — on a rootfs where it resolved fine. The
+  # flat path is still tried: a base image that puts it there is equally good.
+  #
+  # Looked at from here rather than from inside, because the paths are the
+  # rootfs's: `"$DSH_ROOTFS"/usr/lib/*/…` is a question this shell can ask, and
+  # the alternative — a shell inside the chroot expanding a pattern — is a
+  # question no host-side test can arrange, which is how the two-pattern version
+  # stayed untested.
+  for p in "$DSH_ROOTFS"/usr/lib/*/libstdc++.so.6* "$DSH_ROOTFS"/usr/lib/libstdc++.so.6*; do
+    [ -e "$p" ] && return 0
+  done
   printf 'libstdc++.so.6\n'
 }
 
@@ -216,6 +247,10 @@ check_libs() {
 # ---------------------------------------------------------------------------
 
 step_install() {
+  if [ -n "$INSTALL_SKIP" ]; then
+    log "phase 2b: npm install skipped ($INSTALL_SKIP)"
+    return 0
+  fi
   log "phase 2b: npm install --global @deepseek-ai/dsh@$VERSION (--ignore-scripts)"
   if [ "$DRY_RUN" = 1 ]; then
     log "dry-run: would install @deepseek-ai/dsh@$VERSION into $DSH_ROOTFS/usr/local"
@@ -253,6 +288,12 @@ step_install() {
 # 0600 because it names the harness home and version but no secrets.
 
 step_manifest() {
+  if [ -n "$INSTALL_SKIP" ]; then
+    # The manifest is the record of an install that did not happen this time: it
+    # is already there, and rewriting it would move installed_at for no reason.
+    log "phase 2c: manifest kept ($INSTALL_SKIP)"
+    return 0
+  fi
   log "phase 2c: manifest at $MANIFEST"
   [ "$DRY_RUN" = 1 ] && { log "dry-run: would write $MANIFEST"; return 0; }
   mkdir -p "$DSH_ROOTFS/opt/dsh-android"

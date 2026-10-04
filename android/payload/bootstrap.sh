@@ -9,7 +9,16 @@
 # The app runs it like this, with the payload's tar on stdin:
 #
 #   su -c 'S=/data/local/dsh/.stage; rm -rf "$S"; (umask 077; mkdir -p "$S") &&
-#          tar -xf - -C "$S" && exec sh "$S/bootstrap.sh" setup --app-uid 10123'
+#          tar -xf - -C "$S" && exec sh "$S/bootstrap.sh" --from "$S" setup --app-uid 10123'
+#
+# --from is the other half of that command, not a convenience. The tar in front of
+# it has read stdin to the end by the time this file starts, so a run left to
+# extract the payload itself reads an empty stream, says `tar: Not tar`, and stops
+# at "the payload did not extract" — on a phone, right after the install directory
+# had passed, which is exactly what one reported. With --from the stage that tar
+# just filled is the payload, and it goes through the same digest check as any
+# other source: what is handed over is verified, not trusted because the app
+# unpacked it.
 #
 # Every word of that is a constant in android/src/.../Shell.java, except the uid,
 # which the app validates as numeric before it goes anywhere near a shell.
@@ -27,7 +36,8 @@
 #      the directory it had made a line earlier and the person holding the phone,
 #      who has no terminal by design, had nowhere to go. What cannot be fixed
 #      still refuses: an owner that is not root, a symlink, a chmod that did not
-#      take. See tests/payload.test.sh for both halves of that
+#      take. See tests/payload.test.sh for both halves of that, and for the shell
+#      on a phone whose arithmetic read the mode as decimal rather than octal
 #   3. extract the tar, then verify every file against payload.sha256 *before*
 #      installing any of it. A payload that arrived truncated fails here, by
 #      digest, instead of half-installing and half-working
@@ -159,6 +169,46 @@ check_root() {
   boot_emit "ok root"
 }
 
+# A mode with its leading zeros removed, so the 700 one stat prints and the 0700
+# another might compare equal. A mode is only ever handled as this string; every
+# test below is on its digits, and none of them computes with it.
+#
+# That is the whole reason these two helpers exist. What a number with a leading
+# zero *means* is the shell's decision, not ours: 0700 is 448 to dash and bash
+# and 700 to the sh Android ships — mksh's, or toybox sh's, depending on the
+# device — whose arithmetic reads it as decimal. So `$((mode & 022))` is 0 for an
+# already-correct 0700 directory on a development host and 20 on a phone, and 20
+# is nonzero: the phone refused its own install directory, exit 7, "the group or
+# other write bits could not be closed on it", over a directory that had no write
+# bits to close, with no terminal anywhere on the device to see why. Host tests
+# cannot catch that by being thorough (they were, and it passed every one); they
+# catch it by running the cases under a shell that reads leading zeros as
+# decimal, which is what tests/payload.test.sh now does.
+mode_digits() {
+  digits=$1
+  while [ "${digits#0}" != "$digits" ]; do
+    digits=${digits#0}
+  done
+  [ -n "$digits" ] || digits=0
+  printf '%s\n' "$digits"
+}
+
+# Whether group or other can write. In a mode string those bits are the `2`s of
+# the last two octal digits, so a digit of 2, 3, 6 or 7 in either of those two
+# positions is the entire test — no arithmetic for a shell to read differently,
+# and no mask to get wrong. The setuid and setgid bits are not write bits and are
+# deliberately not part of it: "2700" is a directory nobody but root can write,
+# and this has nothing to say about it. ${1%??} is the mode without its last two
+# digits, so for "2700" the two compared are "00" and not "27".
+others_can_write() {
+  rest=${1%??}
+  last_two=${1#"$rest"}
+  case "$last_two" in
+    *[2367]*) return 0 ;;
+  esac
+  return 1
+}
+
 # Closes the group and other write bits on a directory root will run scripts
 # from, then re-reads the mode rather than trusting chmod's exit status. Sets
 # $TIGHTENED_FROM and $TIGHTENED_TO to the before and after modes, or leaves
@@ -174,15 +224,17 @@ tighten_dir() {
   TIGHTENED_FROM=""
   TIGHTENED_TO=""
   mode=$(mode_of "$dir") || return 1
-  perm=$((0$mode))
-  [ $((perm & 07777)) -eq 0700 ] && return 0
+  mode=$(mode_digits "$mode")
+
+  [ "$mode" = 700 ] && return 0
 
   chmod 700 "$dir" 2>/dev/null
   after=$(mode_of "$dir") || return 1
+  after=$(mode_digits "$after")
 
   # Fatal first, whatever chmod claimed: if somebody other than root can still
   # write here, nothing below matters.
-  [ $((0$after & 022)) -eq 0 ] || return 1
+  others_can_write "$after" && return 1
 
   if [ "$after" = "$mode" ]; then
     # No write bits left and the chmod changed nothing — it failed, or the
@@ -192,7 +244,7 @@ tighten_dir() {
   TIGHTENED_FROM=$mode
   TIGHTENED_TO=$after
 
-  if [ $((perm & 022)) -ne 0 ]; then
+  if others_can_write "$mode"; then
     boot_warn "$dir was mode $mode: group- or other-writable, so another uid could replace the scripts root runs. It is mode $after now."
   else
     boot_warn "$dir was mode $mode; it is mode $after now, like the rest of the install"
@@ -272,18 +324,23 @@ VERIFIED_COUNT=0
 verify_payload() {
   [ -f "$STAGE/$MANIFEST" ] || boot_die "$EXIT_PAYLOAD" "no manifest at $STAGE/$MANIFEST"
   VERIFIED_COUNT=0
-  while read -r mode sum path; do
-    # Comments carry the `#` in $mode, not in $path: reading the line splits it
-    # into three words, so testing only $path let every header line through as a
-    # file named after the rest of the sentence. Blank lines leave both empty.
+  while read -r mode sum file; do
+    # Comments carry the `#` in $mode, not in $file: reading the line splits it
+    # into three words, so testing only the third word let every header line
+    # through as a file named after the rest of the sentence. Blank lines leave
+    # every one of them empty. The name is `file` and not `path` because zsh and
+    # ksh93 tie `path` to PATH: a read into it replaces the search path, and the
+    # sha256 and tr below then "do not exist". Android's sh does not tie them —
+    # checked on a device — but the payload is POSIX sh, and a test that runs it
+    # under a shell with that arithmetic would otherwise fail for this instead.
     [ -n "$mode" ] || continue
-    [ -n "$path" ] || continue
+    [ -n "$file" ] || continue
     case "$mode" in *"#"*) continue ;; esac
-    [ -f "$STAGE/$path" ] || boot_die "$EXIT_PAYLOAD" "$path is listed in the manifest but missing from the payload"
-    actual=$(sha256_of "$STAGE/$path") ||
+    [ -f "$STAGE/$file" ] || boot_die "$EXIT_PAYLOAD" "$file is listed in the manifest but missing from the payload"
+    actual=$(sha256_of "$STAGE/$file") ||
       boot_die "$EXIT_PAYLOAD" "cannot compute a sha256 on this device: no sha256sum, shasum, openssl or BusyBox. Refusing to install unverified files."
     if [ "$actual" != "$sum" ]; then
-      boot_die "$EXIT_PAYLOAD" "$path does not match the manifest (expected ${sum%${sum#??????}}…, got ${actual%${actual#??????}}…)"
+      boot_die "$EXIT_PAYLOAD" "$file does not match the manifest (expected ${sum%${sum#??????}}…, got ${actual%${actual#??????}}…)"
     fi
     VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
   done <"$STAGE/$MANIFEST"
@@ -298,15 +355,15 @@ KEPT=0
 install_payload() {
   CHANGED=0
   KEPT=0
-  while read -r mode sum path; do
-    # Comments carry the `#` in $mode, not in $path: reading the line splits it
-    # into three words, so testing only $path let every header line through as a
-    # file named after the rest of the sentence. Blank lines leave both empty.
+  while read -r mode sum file; do
+    # The same three-word split as verify_payload, and the same reason for the
+    # name: `path` is PATH in the shells that tie them, and this loop reads a
+    # file name into it.
     [ -n "$mode" ] || continue
-    [ -n "$path" ] || continue
+    [ -n "$file" ] || continue
     case "$mode" in *"#"*) continue ;; esac
-    src="$STAGE/$path"
-    dst="$DSH_BASE/$path"
+    src="$STAGE/$file"
+    dst="$DSH_BASE/$file"
     dir=$(dirname "$dst")
     # A symlinked install directory is not one we made, and it decides where root
     # writes. Refused rather than followed.

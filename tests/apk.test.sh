@@ -154,6 +154,75 @@ EOF
   contains "a failed step is named" "setup failed at firewall: exit 5" "$out"
   check "and that step is marked failed" "1" "$(printf '%s\n' "$out" | grep -c 'firewall state=3')"
 
+  # `check` is a query, and the bytes below are the ones a phone wrote when it was
+  # asked: `setup --check` on a device that is simply not set up yet. It exits 3 —
+  # "not running", the code the runbook documents for exactly this — and it never
+  # says `done ok`, because it is not doing anything. Judged by the setup rule,
+  # that screen read "Setup stopped — the setup stopped without saying why (exit
+  # 3)" every time the app opened, above a header that already said "Not set up",
+  # and on a healthy device, where this check exits 0, the same sentence came back
+  # with a 0 in it.
+  cat >"$TMP/check-fresh.txt" <<'EOF'
+##dshd check info installed no
+##dshd check info harness no
+##dshd check info running no
+##dshd check info posture unresolved (run tools/confinement-check.sh)
+##dshd check info root kernelsu-next
+##dshd check info app_uid unset
+EOF
+  out=$(parse --exit 3 --verb check <"$TMP/check-fresh.txt")
+  contains "a check that answered is not a failure" "ok=true" "$out"
+  contains "and has nothing to report as broken" "reason=null" "$out"
+  contains "with the answer still on the info lines" "info  | installed = no" "$out"
+
+  # The same bytes as a *setup* that exited 3: still a failure, which is the half
+  # that must not move.
+  out=$(parse --exit 3 <"$TMP/check-fresh.txt")
+  contains "the same exit from a setup is still one" "ok=false" "$out"
+  contains "and says so" "the setup stopped without saying why (exit 3)" "$out"
+
+  # A check whose exit is 0 because the device *is* set up: it says no `done ok`
+  # either, and it is not a failure for that.
+  printf '##dshd check info installed yes\n##dshd check info running yes\n' >"$TMP/check-ok.txt"
+  out=$(parse --exit 0 --verb check <"$TMP/check-ok.txt")
+  contains "a healthy check is a success" "ok=true" "$out"
+
+  # And the narrow half: a check that answered nothing, or that named a failure,
+  # is still a failure — the rule must not turn a broken run into a quiet screen.
+  out=$(parse --exit 3 --verb check </dev/null)
+  contains "a check that answered nothing is a failure" "ok=false" "$out"
+  printf '##dshd check info installed no\n##dshd check fail payload the payload did not extract\n' \
+    >"$TMP/check-failed.txt"
+  out=$(parse --exit 6 --verb check <"$TMP/check-failed.txt")
+  contains "and so is a check that named a failing step" "ok=false" "$out"
+  contains "with the step that failed" "setup failed at payload" "$out"
+  printf '##dshd check info installed no\n' >"$TMP/check-nonroot.txt"
+  out=$(parse --exit 2 --verb check <"$TMP/check-nonroot.txt")
+  contains "and a check that could not ask is one too" "ok=false" "$out"
+  contains "because root was not granted" "root was not granted" "$out"
+
+  # The verbs that are not `setup` and do not say `done ok` either — start, stop,
+  # status, url, logs, token, mounts, boot. dshd answers those with a status block
+  # and an exit code, and the setup rule read every one of them as a failure: the
+  # device below was running perfectly, and the screen said "Setup stopped — the
+  # setup stopped without saying why (exit 0)" over the status it had just asked
+  # for. The bytes are that status's shape, from the line dshd prints first.
+  printf 'supervisor:  running (pid 30266)\nharness:     running (pid 30289), port 3080 listening\nguard:       running (pid 30395), port 3081 listening\n' \
+    >"$TMP/started.txt"
+  out=$(parse --exit 0 --verb start <"$TMP/started.txt")
+  contains "a start that exited 0 is a success" "ok=true" "$out"
+  contains "and has nothing to report as broken" "reason=null" "$out"
+  out=$(parse --exit 1 --verb start <"$TMP/started.txt")
+  contains "a start that exited 1 is not" "ok=false" "$out"
+  contains "and says which command refused" "start exited 1" "$out"
+  out=$(parse --exit 0 --verb status <"$TMP/started.txt")
+  contains "and a status that answered is a success too" "ok=true" "$out"
+  # The setup rule is untouched: a setup that never said `done ok` is still not a
+  # success, whatever it exited with.
+  out=$(parse --exit 0 <"$TMP/started.txt")
+  contains "a setup with no done line is still not a success" "ok=false" "$out"
+  contains "and still says so" "the setup stopped without saying why (exit 0)" "$out"
+
   # Not root, told apart from everything else. The bytes are the real bootstrap's,
   # refused at its first check: this is the end-to-end proof that a refusal
   # reaches the screen with the words the script wrote, and not with a summary
@@ -307,6 +376,21 @@ else
     "$BT/apksigner" verify --min-sdk-version 24 "$APK" >/dev/null 2>&1 &&
       pass "the APK verifies" || fail "the APK verifies"
 
+    # Two builds, one key. The keystore is kept outside the build directory for
+    # exactly this: a keystore inside it is wiped by the next build, which then
+    # generates a new key, which signs an APK that cannot be installed over the
+    # one on the device. That is INSTALL_FAILED_UPDATE_INCOMPATIBLE, an uninstall,
+    # and a root grant asked for again — found by rebuilding to verify a fix on a
+    # phone, where it is the only place the cost shows up.
+    sh "$BUILD" --out "$TMP/out/sign-a.apk" --no-payload >/dev/null 2>&1
+    sh "$BUILD" --out "$TMP/out/sign-b.apk" --no-payload >/dev/null 2>&1
+    cert_a=$("$BT/apksigner" verify --print-certs "$TMP/out/sign-a.apk" 2>/dev/null |
+      sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+    cert_b=$("$BT/apksigner" verify --print-certs "$TMP/out/sign-b.apk" 2>/dev/null |
+      sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+    check "a second build is signed with the same key as the first" "$cert_a" "$cert_b"
+    check "and the key is a real certificate" "64" "$(printf '%s' "$cert_a" | wc -c | tr -d ' ')"
+
     badging=$("$BT/aapt2" dump badging "$APK" 2>/dev/null)
     contains "the package name is the one the manifest claims" "package: name='dev.dshd.app'" "$badging"
     contains "minSdk is 24" "minSdkVersion:'24'" "$badging"
@@ -351,6 +435,11 @@ else
       "$(grep -ac -- '(umask 077; mkdir -p "$S")' "$TMP/classes.dex")"
     check "and still streams the payload into tar" "1" \
       "$(grep -ac -- ' && tar -xf - -C "$S"' "$TMP/classes.dex")"
+    # And hands that tar's output to the bootstrap, rather than leaving it to read
+    # a stdin the tar has already drained: without this flag the setup stops at
+    # exit 6 on a device with "the payload did not extract", which is what one did.
+    check "and hands the stage it extracted to the bootstrap" "1" \
+      "$(grep -ac -- '--from "$S" ' "$TMP/classes.dex")"
     unzip -p "$APK" assets/payload.id >"$TMP/from-apk.id" 2>/dev/null
     check "and the payload id the app compares against" "$(cat "$TMP/assets/payload.id")" "$(cat "$TMP/from-apk.id")"
 

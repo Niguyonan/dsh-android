@@ -17,8 +17,18 @@ import java.util.List;
  * <pre>
  *   S=/data/local/dsh/.stage; rm -rf "$S"; (umask 077; mkdir -p "$S")
  *     &amp;&amp; tar -xf - -C "$S"                       &lt;- the payload, on stdin
- *     &amp;&amp; exec sh "$S/bootstrap.sh" &lt;verb&gt; ...     &lt;- verify, install, hand over
+ *     &amp;&amp; exec sh "$S/bootstrap.sh" --from "$S" &lt;verb&gt; ...
  * </pre>
+ *
+ * <p>{@code --from "$S"} is what makes those two halves one hand-over instead of
+ * two readers of one stream. The tar above has already read stdin to the end by
+ * the time the bootstrap starts, so a bootstrap left to extract the payload
+ * itself reads nothing, says {@code tar: Not tar}, and stops the setup at exit 6
+ * with "the payload did not extract" — which is what a phone showed, on the
+ * first run that ever got past the install directory. The stage it was given is
+ * the payload; the bootstrap verifies every file in it against the manifest
+ * before installing any of it, exactly as it does when it extracts the archive
+ * itself.
  *
  * <p>The {@code mkdir} runs in a subshell with {@code umask 077}, so the staging
  * directory — and {@code /data/local/dsh} above it, on a first run — is created
@@ -110,7 +120,7 @@ public final class Shell {
         StringBuilder b = new StringBuilder();
         b.append("S=").append(STAGE).append("; rm -rf \"$S\"; (umask 077; mkdir -p \"$S\")")
          .append(" && tar -xf - -C \"$S\"")
-         .append(" && exec sh \"").append(BOOTSTRAP).append("\" ").append(verb);
+         .append(" && exec sh \"").append(BOOTSTRAP).append("\" --from \"$S\" ").append(verb);
         if (extra != null && extra.length() > 0) {
             b.append(' ').append(extra);
         }

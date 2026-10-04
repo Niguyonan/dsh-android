@@ -137,7 +137,7 @@ public final class MainActivity extends Activity implements RunState.Observer {
                 // The preference only decides what the *next* setup writes; an
                 // installed device is switched over now, through the same verb
                 // that installed it, so the two cannot disagree.
-                if (RunState.snapshot().yes("installed")) {
+                if (ready(RunState.snapshot())) {
                     run("boot", on);
                 } else {
                     render();
@@ -212,7 +212,7 @@ public final class MainActivity extends Activity implements RunState.Observer {
         if (v.busy) {
             return;
         }
-        if (!v.yes("installed")) {
+        if (!ready(v)) {
             run("setup", prefs().getBoolean(PREF_AUTOSTART, false));
         } else if (!v.yes("running")) {
             run("start", false);
@@ -220,6 +220,23 @@ public final class MainActivity extends Activity implements RunState.Observer {
             webShowing = true;
             render();
         }
+    }
+
+    /**
+     * Whether the device is set up — which is two facts, not one.
+     *
+     * <p>{@code dshd setup --check} reports {@code installed} (the rootfs and
+     * Node) and {@code harness} (the harness's own {@code dsh}) apart, because a
+     * run can leave the first in place and the second not: a device that stopped
+     * at the harness step answered {@code installed yes} with {@code harness no}.
+     * Keyed on {@code installed} alone, this screen said "the harness is
+     * installed" and offered START, and START refused — correctly, and in words
+     * worth reading: "harness not installed at …/usr/local/bin/dsh — run
+     * tools/install-harness.sh". Both halves are what the button means by set up,
+     * so both halves are what it asks for.
+     */
+    private boolean ready(RunState.View v) {
+        return v.yes("installed") && v.yes("harness");
     }
 
     // ------------------------------------------------------------------
@@ -241,7 +258,7 @@ public final class MainActivity extends Activity implements RunState.Observer {
             status = getString(R.string.status_working) + (step.isEmpty() ? "" : " — " + step);
         } else if (v.yes("running")) {
             status = getString(R.string.status_running);
-        } else if (v.yes("installed")) {
+        } else if (ready(v)) {
             status = getString(R.string.status_stopped);
         } else {
             status = getString(R.string.status_not_set_up);
@@ -268,7 +285,7 @@ public final class MainActivity extends Activity implements RunState.Observer {
         } else if (v.finished && !v.ok) {
             setupTitle.setText(R.string.setup_failed_title);
             setupBody.setText(v.reason == null ? getString(R.string.setup_failed_body) : v.reason);
-        } else if (!v.yes("installed")) {
+        } else if (!ready(v)) {
             setupTitle.setText(R.string.setup_title);
             setupBody.setText(R.string.setup_body);
         } else if (!v.yes("running")) {
@@ -280,8 +297,8 @@ public final class MainActivity extends Activity implements RunState.Observer {
         }
 
         primaryButton.setEnabled(!v.busy);
-        secondaryButton.setVisibility(v.yes("installed") && !v.busy ? View.VISIBLE : View.GONE);
-        primaryButton.setText(!v.yes("installed") ? R.string.action_set_up
+        secondaryButton.setVisibility(ready(v) && !v.busy ? View.VISIBLE : View.GONE);
+        primaryButton.setText(!ready(v) ? R.string.action_set_up
                 : (v.yes("running") ? R.string.action_open : R.string.action_start));
         autostartButton.setText(prefs().getBoolean(PREF_AUTOSTART, false)
                 ? R.string.autostart_on : R.string.autostart_off);

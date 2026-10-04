@@ -48,6 +48,11 @@ contains() {
   esac
 }
 
+skip_note() {
+  TESTS_RUN=$((TESTS_RUN + 1))
+  printf 'skip %s (%s)\n' "$1" "$2"
+}
+
 cleanup() { [ -n "$TMP" ] && rm -rf "$TMP"; }
 TMP=""
 trap cleanup EXIT INT TERM
@@ -238,6 +243,74 @@ case_dns_fallback() {
   contains "the fallback resolvers are written" "nameserver 1.1.1.1" "$body"
 }
 
+# The one case where the script reads a *listing* rather than a file named on the
+# command line — which is what a device does, and what "install the newest
+# ubuntu-base" means. The network is the stubbed part: a `curl` in the test's PATH
+# answers the three URLs `fetch` asks for, from files the test wrote. Everything
+# else is the script's own code, including `discover_base_file` and the log line
+# that used to end up inside the file name.
+#
+# It is here because every other case hands the script a local tarball, so nothing
+# ran discovery: `fetch` logs on stdout, the caller captures stdout, and the name
+# came back as
+#
+#   "2026-10-04T12:31:11+0800 rootfs-setup: fetching https://…/release/\n
+#    ubuntu-base-24.04.5-base-arm64.tar.gz"
+#
+# — a URL with a timestamp and a newline in it. On the phone, curl refused it
+# ("URL rejected: Malformed input to a URL function") and BusyBox wget answered
+# 400 Bad Request, and the step's error message blamed the network.
+case_discovers_from_a_listing() {
+  make_env
+  make_base_tarball "$TMP/base-older.tar.gz" older
+  make_base_tarball "$TMP/base-newest.tar.gz" newest
+  # Two point releases in the listing, the newer one *first* so that taking the
+  # newest cannot be an accident of order — and 24.04.5 against 24.04.10, which
+  # lexically sorts the wrong way, is the comparison the script does by hand.
+  cat >"$TMP/listing.txt" <<'EOF'
+<a href="ubuntu-base-24.04.5-base-arm64.tar.gz">ubuntu-base-24.04.5-base-arm64.tar.gz</a>
+<a href="ubuntu-base-24.04.10-base-arm64.tar.gz">ubuntu-base-24.04.10-base-arm64.tar.gz</a>
+<a href="ubuntu-base-24.04.1-base-arm64.tar.gz">ubuntu-base-24.04.1-base-arm64.tar.gz</a>
+EOF
+  printf '%s  %s\n' "$(sha_of "$TMP/base-newest.tar.gz")" "ubuntu-base-24.04.10-base-arm64.tar.gz" \
+    >"$TMP/SHA256SUMS"
+
+  # A curl that logs nothing and answers by destination, the way the real one
+  # answers by URL: fetch's own `log` line is what the test is about.
+  cat >"$TMP/bin/curl" <<EOF
+#!/bin/sh
+dest=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) shift; dest=\$1 ;;
+  esac
+  shift
+done
+case "\$dest" in
+  */.listing) cp "$TMP/listing.txt" "\$dest" ;;
+  *SHA256SUMS) cp "$TMP/SHA256SUMS" "\$dest" ;;
+  *) cp "$TMP/base-newest.tar.gz" "\$dest" ;;
+esac
+EOF
+  chmod +x "$TMP/bin/curl"
+
+  # DSH_BASE_URL is the mirror knob the script reads — what makes this case
+  # possible without a network. The stub answers whatever it is asked, so the
+  # assertion below is about the URL the script *built*, not about the answer.
+  MIRROR="https://cdimage.example/ubuntu-base/releases/24.04/release"
+  out=$(DSH_BASE_URL="$MIRROR" setup --skip-node --skip-verify 2>&1)
+  rc=$?
+  check "a listing is read and the base image installed from it" "0" "$rc"
+  check "the newest point release wins, not the first line or the lexical order" "newest" \
+    "$(cat "$BASE/rootfs/etc/dsh-test-marker" 2>/dev/null)"
+  contains "and it is named on its own" "newest base image: ubuntu-base-24.04.10-base-arm64.tar.gz" "$out"
+  contains "and fetched by that name" "$MIRROR/ubuntu-base-24.04.10-base-arm64.tar.gz" "$out"
+  case "$out" in
+    *"release/20"*) fail "the name carries no log line" "$(printf '%s' "$out" | head -n 3)" ;;
+    *) pass "the name carries no log line" ;;
+  esac
+}
+
 # ===========================================================================
 
 case_syntax
@@ -249,6 +322,7 @@ case_never_clobbers
 case_resolv_symlink
 case_dry_run_changes_nothing
 case_dns_fallback
+case_discovers_from_a_listing
 
 printf '\n%s run, %s failed\n' "$TESTS_RUN" "$TESTS_FAILED"
 [ "$TESTS_FAILED" -eq 0 ] || exit 1
