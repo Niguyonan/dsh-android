@@ -357,12 +357,28 @@ cmd_url() {
 # healthy and the UI is unreachable. tools/install-harness.sh asserts the same
 # contract at install time, so a version bump that changes it is caught before
 # anyone depends on it.
+#
+# $1 is the log size at the moment this harness was spawned: only a line written
+# *after* that belongs to the process that is running now. The log is appended to
+# across restarts, and the harness mints a fresh token every time it starts, so
+# without the offset a restart captures the previous run's token — instantly,
+# because it is already on disk — and starts a guard holding a token the new
+# harness has never heard of. The result is a device that looks healthy and
+# answers every login with "502 … upstream bootstrap answered 401 … the harness
+# launch-token contract changed", which is what one did, twice, and what the
+# supervisor's own restart path did on every crash.
 capture_launch_token() {
   log_file=$DSH_LOG/harness.log
+  from=${1:-0}
+  case "$from" in
+    '' | *[!0-9]*) from=0 ;;
+  esac
   waited=0
   while [ "$waited" -lt "$DSH_LAUNCH_TIMEOUT" ]; do
     if [ -f "$log_file" ]; then
-      line=$(sed -n 's|.*http://127\.0\.0\.1:[0-9][0-9]*/?token=\([A-Za-z0-9_-][A-Za-z0-9_-]*\).*|\1|p' "$log_file" | tail -n 1)
+      line=$(tail -c "+$((from + 1))" "$log_file" 2>/dev/null |
+        sed -n 's|.*http://127\.0\.0\.1:[0-9][0-9]*/?token=\([A-Za-z0-9_-][A-Za-z0-9_-]*\).*|\1|p' |
+        tail -n 1)
       if [ -n "$line" ]; then
         (umask 077; printf '%s\n' "$line" >"$(harness_token_path)") || die "cannot write $(harness_token_path)"
         printf '%s\n' "$line"
@@ -670,6 +686,15 @@ start_harness() {
   fi
   # 0<&- style detachment matters: the supervisor keeps its own log fds, and
   # the child must not hold the caller's terminal open.
+  #
+  # Where the log ends right now is this run's starting point: see
+  # capture_launch_token(). Measured before the spawn, never after — the harness
+  # prints its token within a second of starting, and a size taken afterwards
+  # would cut off the very line it is needed for.
+  harness_log_start=$(file_size "$DSH_LOG/harness.log")
+  case "$harness_log_start" in
+    '' | *[!0-9]*) harness_log_start=0 ;;
+  esac
   spawn_in_rootfs "$DSH_LOG/harness.log" "$DSH_HARNESS_BIN" \
     web --no-open --port "$DSH_HARNESS_PORT"
   harness_pid=$spawned_pid
@@ -692,7 +717,7 @@ start_guard() {
   # Fail closed: without the harness's own token the guard cannot open a session
   # behind its login, so starting it would swap one broken front door for
   # another. See capture_launch_token().
-  if ! launch_token=$(capture_launch_token); then
+  if ! launch_token=$(capture_launch_token "${harness_log_start:-0}"); then
     die "the harness printed no launch token within ${DSH_LAUNCH_TIMEOUT}s (looked for 'http://127.0.0.1:<port>/?token=...' in $DSH_LOG/harness.log) — refusing to start a guard that cannot authenticate to the harness. If the harness version changed this URL shape, that is the contract to fix; see tools/install-harness.sh."
   fi
   upstream_token_file=$(in_rootfs_path "$(harness_token_path_in)")
@@ -871,6 +896,7 @@ cmd_start() {
   if pid=$(read_pid_file "$DSH_RUN/supervisor.pid") && pid_is_ours "$pid" dshd; then
     log "already running (supervisor pid $pid)"
     cmd_status
+    state_emit start
     return 0
   fi
 
@@ -880,6 +906,7 @@ cmd_start() {
 
   if [ "$DSHD_DRY_RUN" = 1 ]; then
     log "dry-run: supervisor not spawned"
+    state_emit start
     return 0
   fi
 
@@ -899,6 +926,7 @@ cmd_start() {
     if port_listening "$DSH_HARNESS_PORT" && port_listening "$DSH_GUARD_PORT"; then
       log "ready after ${waited}s"
       cmd_status
+      state_emit start
       return 0
     fi
     sleep 1
@@ -931,6 +959,9 @@ cmd_stop() {
   run rm -f "$DSH_RUN/supervisor.pid" "$DSH_RUN/stop"
   umount_mounts
   log "stopped"
+  # "Stopped" is a state the app draws from, and without this block it had none:
+  # a tap on STOP left the screen on "Not set up" with SET UP where START belongs.
+  state_emit stop
 }
 
 cmd_restart() {
@@ -1339,6 +1370,10 @@ cmd_setup() {
 
   require_root
 
+  # From here this run reports its own state block when it finishes, so the verbs
+  # it calls on the way (start) stay quiet. See state_emit().
+  SETUP_RUN=1
+
   # A numeric uid is not decoration: it lands in a config file that root sources
   # and in an iptables rule that decides who reaches the port. Anything else is
   # refused rather than escaped.
@@ -1395,16 +1430,23 @@ cmd_setup() {
   else
     setup_emit "note the running URL could not be read back; 'dshd url' will say why"
   fi
+  # The same state block a check reports, so the app's screens are right the
+  # moment a setup ends rather than at the next resume. See setup_state_lines().
+  setup_state_lines
   setup_emit "done ok"
   return 0
 }
 
-# What the app asks before it decides which screen to show. Machine-readable on
-# the same protocol, so the app has one parser and not two grammars.
-cmd_setup_check() {
-  require_root
-  SETUP_NONCE=check
-
+# The state block the app keys every screen on: installed, harness, running,
+# posture, payload, root, app_uid. Read from the device, never remembered.
+#
+# Both `setup` and `setup --check` emit it. A setup used to emit none of it, so
+# the app had nothing to read when a setup *finished*: it drew "Not set up", with
+# SET UP where START belongs and no STOP button, over a harness that was
+# installed, running and already on screen in the WebView. One resume fixed it —
+# onResume runs a check — which is why it survived: the wrong screen is what you
+# get if you look at the app instead of leaving it and coming back.
+setup_state_lines() {
   check_installed=no
   if [ -x "$DSH_ROOTFS/bin/sh" ] && [ -x "$(host_path "$DSH_NODE")" ]; then
     check_installed=yes
@@ -1424,6 +1466,29 @@ cmd_setup_check() {
   setup_emit "info root $(root_solution)"
   check_uid=$(sed -n 's/^DSH_APP_UID=//p' "$DSH_ETC/dshd.conf" 2>/dev/null | head -n 1)
   setup_emit "info app_uid ${check_uid:-unset}"
+}
+
+# A verb that changed what is running reports the same state block a check does,
+# so the app's screen is right when the verb ends rather than at the next resume.
+#
+# Silent inside a setup: that run has its own nonce, reports the block itself when
+# it finishes, and saying it twice on one stream is noise. Two verbs in one run
+# (`restart`) share the nonce of the first — a second nonce in one stream is two
+# writers as far as the app is concerned — and both report, because the second
+# one is the state the run ended in.
+state_emit() {
+  [ "${SETUP_RUN:-0}" = 1 ] && return 0
+  [ -n "${SETUP_NONCE:-}" ] || SETUP_NONCE=$1
+  setup_state_lines
+}
+
+# What the app asks before it decides which screen to show. Machine-readable on
+# the same protocol, so the app has one parser and not two grammars.
+cmd_setup_check() {
+  require_root
+  SETUP_NONCE=check
+
+  setup_state_lines
   if [ "$check_running" = yes ]; then
     check_url=$(cmd_url 2>/dev/null | tail -n 1)
     [ -n "$check_url" ] && setup_emit "url $check_url"

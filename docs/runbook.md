@@ -239,6 +239,7 @@ measurement — but it is the half that stops a stranger reaching it.
 | *Starting the server* times out | `/dev/pts` not mounted, or the harness exited at once | `log/harness.log`, `log/guard.log`, then `sh bin/dshd mounts` |
 | The app says *Stopped* after a reboot | Autostart is off, or the boot script did not run | `sh bin/dshd boot status`, `log/autostart.log` |
 | The WebView is blank but the status says *Running* | The token was not accepted, or the page is being blocked | `sh bin/dshd url`, then open that URL in the device's browser to see the guard's own answer |
+| The WebView shows *502 … upstream bootstrap answered 401 … the harness launch-token contract changed* | The guard is holding a launch token the running harness did not issue — a restart before the fix below, or a `state/harness.token` edited by hand. It is not the harness version: that text is the guard's guess | `sh bin/dshd restart` re-captures the token. If it comes back, `log/harness.log` should have one `?token=` line per start, and `state/harness.token` should equal the last of them |
 
 `sh bin/dshd doctor` prints the status summary plus the Phase 6 `tools/doctor.sh`
 if it is installed; it is not written yet.
@@ -322,6 +323,15 @@ inside the chroot, the posture recorded, and the server started —
 defects in this repository surfaced doing it, each in a path only a device ran:
 they are the entries at the end of
 [`engineering.md`](engineering.md#defects-the-host-tests-caught-and-what-they-cost-on-a-device).
+A later session on the same device added two more, and both were found by using
+the app rather than by testing it: the composer's paperclip did nothing at all
+because the app had no `WebChromeClient` to answer `<input type="file">` (the
+same harness attaches files in a browser), and every `STOP` + `START` came back
+to a **502 … upstream bootstrap answered 401** screen because a restarted harness
+mints a new launch token while `dshd` was capturing the previous run's line out
+of its own log. Both are fixed and both have cases that fail without the fix —
+`tests/apk.test.sh` for the file input, `tests/dshd.test.sh`'s relaunch case for
+the token, whose oracle is a login through the guard (303, not 502).
 What the run confirms about the device, rather than about this repository:
 KernelSU-Next forwards stdin to `su -c`; `su` is not on `PATH` for an app that has
 not been granted (the probe reports `no su binary answered`, not exit 2); the su

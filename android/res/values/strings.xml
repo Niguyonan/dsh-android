@@ -55,4 +55,7 @@
     <string name="error_bad_url">The server gave an address this app cannot use.</string>
     <string name="error_no_browser">No browser to open that link in.</string>
     <string name="error_blocked_navigation">That kind of link is blocked.</string>
+    <string name="pick_file">Choose a file</string>
+    <string name="error_no_picker">No file picker on this device.</string>
+    <string name="error_blocked_file">That file is blocked: the page does not get this app\'s own files.</string>
 </resources>

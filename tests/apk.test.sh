@@ -308,6 +308,27 @@ contains "content access is off" "setAllowContentAccess(false)" "$sources"
 contains "mixed content is refused" "MIXED_CONTENT_NEVER_ALLOW" "$sources"
 contains "the WebView is created without a view id" "No view id on purpose" "$sources"
 
+# The page's file input. A WebView hands <input type="file"> to a
+# WebChromeClient, and an app that has none is answered *for* it with null: no
+# picker, no error, nothing the page can report. The harness attaches files with
+# that input, and it does so in a browser — which is exactly why this looked like
+# an app that could not upload while the browser could.
+contains "the page's file input is answered at all" "onShowFileChooser" "$sources"
+contains "with an intent built from the page's own parameters" \
+  "params.createIntent()" "$sources"
+contains "and the answer is tied to the request that asked" "REQUEST_PICK_FILES" "$sources"
+# FileChooserParams.parseResult reads intent.getData() and nothing else, and the
+# system picker returns a multiple selection as ClipData with no data URI at all.
+# The harness's input is `multiple`, so that difference is every file after the
+# first — silently dropped, in a page that saw one arrive.
+contains "a multiple selection is read from the ClipData" "data.getClipData()" "$sources"
+# The result of a picker is untrusted, and the platform's own documentation says
+# it can name this app's private files. Content URIs are taken; file URIs are
+# taken only from outside this app's data directory.
+contains "a picked file that is this app's own is refused" \
+  "getApplicationInfo().dataDir" "$sources"
+contains "compared on canonical paths, not on spelling" "getCanonicalPath()" "$sources"
+
 # The one command the app sends to root, and the mode it creates the install
 # directory with. That directory is where root runs scripts from, and leaving its
 # mode to the umask of whatever `su` shell the device happens to start is how a
@@ -399,6 +420,12 @@ else
     contains "INTERNET is requested" "android.permission.INTERNET" "$badging"
     contains "the foreground service type is declared" "android.permission.FOREGROUND_SERVICE_DATA_SYNC" "$badging"
     lacks "nothing asks for storage access" "WRITE_EXTERNAL_STORAGE" "$badging"
+    # The file picker is the system's, and it grants this app a read on the one
+    # file the user chose. A storage or media permission here would mean the app
+    # had gone back to reading the filesystem itself.
+    lacks "the file picker needs no storage permission" "READ_EXTERNAL_STORAGE" "$badging"
+    lacks "nor a media permission" "READ_MEDIA_IMAGES" "$badging"
+    lacks "and the page cannot ask for a camera" "android.permission.CAMERA" "$badging"
     lacks "nothing asks to install packages" "REQUEST_INSTALL_PACKAGES" "$badging"
 
     tree=$("$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" 2>/dev/null)
@@ -440,6 +467,11 @@ else
     # exit 6 on a device with "the payload did not extract", which is what one did.
     check "and hands the stage it extracted to the bootstrap" "1" \
       "$(grep -ac -- '--from "$S" ' "$TMP/classes.dex")"
+    # The built artifact, not the source of it: a WebChromeClient that never made
+    # it into the dex is the difference between an app that attaches files and one
+    # that silently answers the page's file input with null.
+    check "the shipped dex answers the page's file input" "1" \
+      "$(grep -ac -- 'onShowFileChooser' "$TMP/classes.dex")"
     unzip -p "$APK" assets/payload.id >"$TMP/from-apk.id" 2>/dev/null
     check "and the payload id the app compares against" "$(cat "$TMP/assets/payload.id")" "$(cat "$TMP/from-apk.id")"
 

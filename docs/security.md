@@ -326,6 +326,19 @@ system browser, where the user can see where it goes. The WebView is created in
 code with no view id, so the framework does not fold its state — which includes
 the tokenised URL it was handed — into the saved instance state.
 
+**What the page can attach, and what it cannot.** The harness's file input is
+answered by the system picker (`WebChromeClient.onShowFileChooser`), so the app
+asks for no storage permission and reads no filesystem of its own: the picker
+grants it a read on the one file the user chose. That result is untrusted — the
+platform's own documentation says a file chooser result "can contain Uris
+pointing to your own app's sensitive data files" — and a page that can read a
+file can upload it to the agent, so the app checks it before handing it over:
+`content:` results are taken (what the system picker returns), `file:` results
+only from outside this app's data directory, compared on canonical paths, and
+the whole selection is refused together rather than in part. Chromium applies the
+same rule in its own file dialog; WebView does not apply it for the app, and the
+platform says so in `FileChooserParams.createIntent()`'s javadoc.
+
 **What the app keeps on disk.** The guard's session cookie, in the WebView's
 cookie store inside the app's private data directory. That is the same boundary
 the rest of this stack relies on: file permissions plus file-based encryption,

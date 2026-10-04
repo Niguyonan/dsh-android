@@ -278,6 +278,12 @@ case_start_dry_run() {
   check "dry-run start exits 0" "0" "$rc"
   contains "dry-run start says it did not spawn" "dry-run: supervisor not spawned" "$out"
   contains "dry-run start announces the token it would mint" "dry-run: would generate" "$out"
+  # A verb that changed what is running reports the state the app draws its
+  # screen from, with the run's own nonce — an empty nonce would shift every
+  # field the app parses. A dry run spawned nothing, so it reports that.
+  contains "start reports the state the app reads" "info running no" "$out"
+  contains "under a nonce the app can parse" "yes" \
+    "$(printf '%s\n' "$out" | awk '$1 == "##dshd" && $2 != "" && $3 == "info" { found = 1 } END { print found ? "yes" : "no" }')"
 
   if [ -d "$DSH_LOG" ]; then pass "dry-run start creates the skeleton directories"; else fail "dry-run start creates the skeleton directories"; fi
   if [ -f "$DSH_RUN/supervisor.pid" ]; then
@@ -399,24 +405,40 @@ case_supervise_loop() {
 # really spawned, really killed, and really restarted; the ports are really
 # bound and really released.
 
-# Stand-in harness: a loopback listener. `dshd` only needs `web --no-open
-# --port N` to bind the port, so this exercises readiness, liveness and restart
-# without installing the harness itself.
+# Stand-in harness: a loopback HTTP listener speaking the two things `dshd` and
+# the guard depend on. `dshd` only needs `web --no-open --port N` to bind the
+# port, so this exercises readiness, liveness and restart without installing the
+# harness itself.
 make_rootfs_shims() {
   mkdir -p "$DSH_ROOTFS/usr/local/bin" "$DSH_ROOTFS/opt/dsh-android"
 
   cat >"$DSH_ROOTFS/opt/harness-standin.js" <<'EOS'
-const net = require('node:net')
+const http = require('node:http')
 const port = Number(process.argv[2] || 3080)
-// The launch-token line, because it is the contract dshd depends on: the real
-// harness prints exactly this to stdout, and dshd refuses to start a guard
-// without it. A stand-in that stayed silent would test a system that cannot
+// A *fresh* token every start, exactly as the real harness mints one. A
+// stand-in that reused a token could not tell "captured from the harness
+// running now" from "captured from the one that just died", which is the
+// difference the relaunch case exists to catch: it passed here for months with
+// a constant token while every real restart handed the guard a dead one.
+const LAUNCH_TOKEN = `standin_${process.pid}_${Date.now()}`
+// The launch-token contract, because dshd depends on it: the real harness prints
+// exactly this line to stdout, refuses to start a guard without it, and the
+// guard replays `GET /?token=…` expecting 303 and a session cookie. A stand-in
+// that stayed silent, or answered anything else, would test a system that cannot
 // exist on a device.
-const LAUNCH_TOKEN = 'standin_launch_token_0123456789abcdefghijkl'
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://127.0.0.1:${port}`)
+  if (url.pathname === '/' && url.searchParams.get('token') === LAUNCH_TOKEN) {
+    res.writeHead(303, { location: './', 'set-cookie': 'dsh_session=standin; Path=/; HttpOnly' })
+    res.end()
+    return
+  }
+  res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
+  res.end('dsh web authentication required; reopen the URL printed by dsh web.\n')
+})
 // Behave like a server, not like a script: a killed peer is not a crash.
-const server = net.createServer((socket) => {
-  socket.on('error', () => {})
-  socket.end('stand-in harness\n')
+server.on('clientError', (err, socket) => {
+  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
 })
 server.on('error', (err) => {
   console.error(`stand-in harness: ${err.message}`)
@@ -589,6 +611,11 @@ case_real_pair() {
   rc=$?
   check "stop exits 0" "0" "$rc"
   contains "stop signals the supervisor" "signalling supervisor" "$out"
+  # The other half of the same contract: a tap on STOP has to leave the app with
+  # something to draw. Without this block the screen went to "Not set up" with SET
+  # UP where START belongs, over a machine that had merely been stopped.
+  contains "stop reports the state the app reads" "info running no" "$out"
+  contains "and still reports the install keys it did not remove" "info installed" "$out"
   if wait_until 40 sh -c "! nc -z 127.0.0.1 $DSH_HARNESS_PORT >/dev/null 2>&1 && ! nc -z 127.0.0.1 $DSH_GUARD_PORT >/dev/null 2>&1"; then
     pass "stop releases both ports"
   else
@@ -893,7 +920,12 @@ case_chroot_argv() {
   make_self_shim
 
   # `chroot` records what it was asked to run and then stays alive, so the
-  # supervisor sees a live pair instead of restarting it under the test.
+  # supervisor sees a live pair instead of restarting it under the test. It also
+  # prints the harness's launch-token line, because that is what the real child
+  # does on stdout and the parent's redirection is what puts it in harness.log:
+  # the guard step is not reached without it. Seeding that line into the log
+  # beforehand — which this case used to do — is now the *defect* the relaunch
+  # case covers, not a way to stand in for a harness.
   cat >"$TMP/bin/mount" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >>"$TMP/mount.calls"
@@ -902,15 +934,14 @@ EOF
   cat >"$TMP/bin/chroot" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >>"$TMP/chroot.calls"
+case "\$*" in
+  *"/usr/local/bin/dsh web"*)
+    printf 'dsh web: http://127.0.0.1:%s/?token=%s\n' "$DSH_HARNESS_PORT" "chroot_stub_launch_token_0123456789"
+    ;;
+esac
 exec sleep 30
 EOF
   chmod +x "$TMP/bin/mount" "$TMP/bin/chroot"
-
-  # The launch-token line the real harness prints. Without it the guard step is
-  # never reached: dshd waits, then refuses to start a guard it cannot
-  # authenticate — correct, but not what this case is measuring.
-  printf 'dsh web: http://127.0.0.1:%s/?token=%s\n' "$DSH_HARNESS_PORT" \
-    "seeded_launch_token_0123456789abcdefghijkl" >"$DSH_LOG/harness.log"
 
   sh "$DSHD" supervise >/dev/null 2>&1 &
   sup=$!
@@ -960,7 +991,90 @@ EOF
   check "the captured launch token is 0600" "-rw-------" \
     "$(ls -l "$DSH_STATE/harness.token" 2>/dev/null | cut -c1-10)"
   check "the captured token is the one the harness printed" \
-    "seeded_launch_token_0123456789abcdefghijkl" "$(cat "$DSH_STATE/harness.token" 2>/dev/null)"
+    "chroot_stub_launch_token_0123456789" "$(cat "$DSH_STATE/harness.token" 2>/dev/null)"
+}
+
+# A harness mints a new launch token every time it starts, and the supervisor
+# restarts the pair whenever either child dies. dshd reads that token back out of
+# the harness's log — a file the supervisor appends to across restarts — so a
+# restart used to capture the *previous* run's line, at once, because it was
+# already on disk. Nothing looked wrong: both ports listened, `dshd status` was
+# green, the pair was healthy, and every login answered
+#
+#   502 the guard could not open a harness session behind this login.
+#   upstream bootstrap answered 401 with 0 session cookie(s) …
+#
+# which is what a phone showed, and would have shown after every crash and every
+# `STOP` + `START`, until the whole stack was stopped and started by hand. It
+# passed here for as long as the stand-in printed a constant token, which is the
+# one shape of harness that cannot exist.
+case_relaunch_token() {
+  if [ -z "$NODE_BIN" ] || ! command -v nc >/dev/null 2>&1; then
+    skip "a restarted pair captures the new launch token" "needs node and nc"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    skip "a restarted pair captures the new launch token" "needs curl"
+    return 0
+  fi
+
+  env_new
+  DSHD_DRY_RUN=0
+  export DSHD_DRY_RUN
+  make_rootfs_shims
+  make_id_double
+  make_self_shim
+
+  dshd start >/dev/null 2>&1
+  first_pid=$(pid_of "$DSH_RUN/harness.pid")
+  first_token=$(cat "$DSH_STATE/harness.token" 2>/dev/null)
+
+  # The crash an OOM kill looks like, with the dead harness's token line left in
+  # the log the new one will be read from.
+  kill -9 "$first_pid" 2>/dev/null
+  if wait_until 60 sh -c "[ \"\$(tr -dc '0-9' <'$DSH_RUN/harness.pid')\" != '$first_pid' ]"; then
+    pass "the supervisor replaced the crashed harness"
+  else
+    fail "the supervisor replaced the crashed harness" \
+      "harness.pid still $(cat "$DSH_RUN/harness.pid" 2>/dev/null)"
+  fi
+
+  # Wait on the *token file*, not on the harness port. The port is bound as soon
+  # as the new harness listens, and the guard is started a moment later, after
+  # the token has been captured: an assertion taken at port-up races that and
+  # reads the previous run's token — which is how this case failed the first time
+  # it ran, against a dshd that was already correct.
+  if wait_until 60 sh -c "[ \"\$(cat '$DSH_STATE/harness.token' 2>/dev/null)\" != '$first_token' ]"; then
+    pass "the restarted pair captured a token that is not the dead one"
+  else
+    fail "the restarted pair captured a token that is not the dead one" \
+      "harness.token is still [$first_token]"
+  fi
+
+  # The oracle is the harness's own output: the last token line it printed, which
+  # the stand-in regenerates per process. Two identical tokens would make the
+  # comparison below vacuous, so that is asserted first.
+  printed=$(sed -n 's|.*http://127\.0\.0\.1:[0-9][0-9]*/?token=\([A-Za-z0-9_-][A-Za-z0-9_-]*\).*|\1|p' \
+    "$DSH_LOG/harness.log" | tail -n 1)
+  if [ -n "$printed" ] && [ "$printed" != "$first_token" ]; then
+    pass "the restarted harness minted a different token"
+  else
+    fail "the restarted harness minted a different token" \
+      "before=[$first_token] after=[$printed]"
+  fi
+  check "the captured token is the one the running harness printed" \
+    "$printed" "$(cat "$DSH_STATE/harness.token" 2>/dev/null)"
+
+  # And the half a person sees. 303 is a session — the guard exchanged its login
+  # for the harness's own cookie. 502 is the guard holding a token the harness
+  # will not take, which is the screen this case exists for.
+  wait_until 40 port_open "$DSH_GUARD_PORT"
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+    "http://127.0.0.1:$DSH_GUARD_PORT/?token=$(cat "$DSH_STATE/guard.token" 2>/dev/null)")
+  check "and a login through the guard opens a session" "303" "$code"
+
+  dshd stop >/dev/null 2>&1
+  SUPERVISOR_PID=""
 }
 
 # ===========================================================================
@@ -984,6 +1098,7 @@ case_firewall_handover
 case_real_pair
 case_orphaned_children
 case_chroot_argv
+case_relaunch_token
 
 printf '\n%s run, %s failed, %s skipped\n' "$TESTS_RUN" "$TESTS_FAILED" "$TESTS_SKIPPED"
 [ "$TESTS_FAILED" -eq 0 ] || exit 1

@@ -1,6 +1,8 @@
 package dev.dshd.app;
 
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
+import android.content.ClipData;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Typeface;
@@ -14,6 +16,8 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.CookieManager;
 import android.webkit.SslErrorHandler;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -25,6 +29,9 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -45,6 +52,10 @@ import java.util.List;
  *       output, and it does not get to steer the WebView somewhere else
  *   <li>no addJavascriptInterface, ever. A bridge into this app would be a bridge
  *       from agent output to an app that holds root
+ *   <li>the WebView has a WebChromeClient for one reason — the page's file input
+ *       — and the result of that picker is checked before the page is allowed to
+ *       read it: the platform's own documentation says a file chooser result can
+ *       point at this app's private files
  * </ul>
  */
 public final class MainActivity extends Activity implements RunState.Observer {
@@ -52,6 +63,9 @@ public final class MainActivity extends Activity implements RunState.Observer {
     private static final String PREFS = "dshd";
     private static final String PREF_EXPLAINED = "explained";
     private static final String PREF_AUTOSTART = "autostart";
+
+    /** Request code for the one picker this app opens: the page's file input. */
+    private static final int REQUEST_PICK_FILES = 2;
 
     private TextView statusText;
     private TextView bannerText;
@@ -73,6 +87,14 @@ public final class MainActivity extends Activity implements RunState.Observer {
     private String allowedPrefix;
     private boolean webShowing;
     private boolean askedForUrl;
+    /**
+     * The page's unanswered file chooser, or null when no picker is open.
+     *
+     * <p>A file input stays disabled until exactly one of these is answered, so
+     * every path through the picker has to end in a call on it — including the
+     * ones where the user cancels.
+     */
+    private ValueCallback<Uri[]> pendingPick;
     private String stepsSignature = "";
     private long lastLogDraw;
     private boolean logVisible;
@@ -172,6 +194,11 @@ public final class MainActivity extends Activity implements RunState.Observer {
     @Override
     protected void onDestroy() {
         RunState.setObserver(null);
+        // A picker the user left open: the run that asked for it is over, and the
+        // callback belongs to a WebView about to be destroyed. Dropped, not
+        // answered — invoking it against a torn-down WebView is the one way to
+        // turn "the app was closed" into a crash report.
+        pendingPick = null;
         if (web != null) {
             webContainer.removeView(web);
             web.destroy();
@@ -492,7 +519,156 @@ public final class MainActivity extends Activity implements RunState.Observer {
                 handler.cancel();
             }
         });
+
+        // The harness attaches a file with a plain <input type="file">, and that
+        // input is the page's only way to hand the agent something it did not
+        // type. Without a WebChromeClient the WebView answers the request with
+        // null and the button does *nothing at all*: no picker, no error, and
+        // nothing in the page that could report one. The same harness in a
+        // browser attaches files, so the browser was where this worked and the
+        // app was where it did not.
+        view.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> callback,
+                    FileChooserParams params) {
+                return askForFiles(callback, params);
+            }
+        });
         return view;
+    }
+
+    /**
+     * Open the system picker for one {@code <input type="file">} request.
+     *
+     * <p>The intent comes from the page's own parameters — {@code createIntent()}
+     * builds {@code ACTION_GET_CONTENT} with the accept types, and already asks
+     * for multiple selection when the input has {@code multiple}, which the
+     * harness's does.
+     *
+     * <p>Every exit from here calls the callback exactly once, because a file
+     * input that is never answered stays dead for the rest of the page's life:
+     * a device with no picker at all is told out loud rather than left waiting.
+     */
+    private boolean askForFiles(ValueCallback<Uri[]> callback,
+            WebChromeClient.FileChooserParams params) {
+        // One at a time. A second request while the first picker is open — the
+        // page can do that, and a second window can too — would otherwise leave
+        // the first input unanswered for good.
+        if (pendingPick != null) {
+            pendingPick.onReceiveValue(null);
+            pendingPick = null;
+        }
+        Intent picker;
+        try {
+            picker = params.createIntent();
+        } catch (RuntimeException e) {
+            callback.onReceiveValue(null);
+            return true;
+        }
+        try {
+            startActivityForResult(
+                    Intent.createChooser(picker, getString(R.string.pick_file)), REQUEST_PICK_FILES);
+        } catch (ActivityNotFoundException e) {
+            callback.onReceiveValue(null);
+            toast(getString(R.string.error_no_picker));
+            return true;
+        }
+        pendingPick = callback;
+        return true;
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode != REQUEST_PICK_FILES) {
+            super.onActivityResult(requestCode, resultCode, data);
+            return;
+        }
+        ValueCallback<Uri[]> callback = pendingPick;
+        pendingPick = null;
+        if (callback == null) {
+            // The run that opened the picker is gone; there is no page to answer.
+            return;
+        }
+        callback.onReceiveValue(pickedFiles(resultCode, data));
+    }
+
+    /**
+     * The files the user picked, or null — which is also how "cancelled" is said.
+     *
+     * <p>Hand-written rather than {@code FileChooserParams.parseResult}, because
+     * that method reads {@code intent.getData()} and nothing else, and the system
+     * picker returns a multiple selection in the intent's {@code ClipData} with
+     * no data URI at all. The harness's input is {@code multiple}: with
+     * {@code parseResult} the first file chosen would arrive and the rest would
+     * disappear without a word.
+     *
+     * <p>A picker result is untrusted — the platform's own documentation says it
+     * "can contain Uris pointing to your own app's sensitive data files", and
+     * anything the page can read it can upload to the agent. So the whole
+     * selection is accepted or refused together, by {@link #acceptable}: a
+     * {@code content} URI, which is what the system picker returns, or a
+     * {@code file} URI that is not this app's own. Chromium applies the same rule
+     * in its own file dialog; WebView does not apply it for us.
+     */
+    private Uri[] pickedFiles(int resultCode, Intent data) {
+        if (resultCode != RESULT_OK || data == null) {
+            return null;
+        }
+        ArrayList<Uri> candidates = new ArrayList<Uri>();
+        ClipData clip = data.getClipData();
+        if (clip != null) {
+            for (int i = 0; i < clip.getItemCount(); i++) {
+                candidates.add(clip.getItemAt(i).getUri());
+            }
+        }
+        candidates.add(data.getData());
+
+        ArrayList<Uri> files = new ArrayList<Uri>();
+        for (int i = 0; i < candidates.size(); i++) {
+            Uri uri = candidates.get(i);
+            if (uri == null) {
+                continue;
+            }
+            if (!acceptable(uri)) {
+                toast(getString(R.string.error_blocked_file));
+                return null;
+            }
+            files.add(uri);
+        }
+        return files.isEmpty() ? null : files.toArray(new Uri[files.size()]);
+    }
+
+    /**
+     * Whether one picked URI may be handed to the page.
+     *
+     * <p>Only two schemes can name a file the user chose. {@code content} is the
+     * system picker's answer and is taken; anything else — {@code file},
+     * {@code http}, a raw path — has to be a file that is not this app's own,
+     * compared on canonical paths so {@code /data/data/…} and
+     * {@code /data/user/0/…} and a symlink to either are the same answer.
+     * Everything else is refused, which is the choice that cannot leak: the
+     * WebView is showing a page the agent can write to, and this app is the one
+     * holding a root token.
+     */
+    private boolean acceptable(Uri uri) {
+        String scheme = uri.getScheme();
+        if ("content".equals(scheme)) {
+            return true;
+        }
+        if (!"file".equals(scheme) || uri.getPath() == null) {
+            return false;
+        }
+        String dir = getApplicationInfo().dataDir;
+        if (dir == null || dir.isEmpty()) {
+            return false;
+        }
+        try {
+            String path = new File(uri.getPath()).getCanonicalPath();
+            String own = new File(dir).getCanonicalPath();
+            return !path.equals(own) && !path.startsWith(own + File.separator);
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     private boolean handleNavigation(String url) {

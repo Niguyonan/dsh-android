@@ -200,6 +200,24 @@ contains "the run ends with done ok" "done ok" "$out"
 lacks "and never with done fail" "done fail" "$out"
 check "there is exactly one done event" "1" "$(printf '%s\n' "$out" | grep -c ' done ')"
 contains "the url is handed back to the app" "url http://127.0.0.1:3081/?token=guard-token-for-tests" "$out"
+# And the state block a check reports, as the setup's last act. Without it the
+# app had nothing to read when a setup *finished*: it drew "Not set up", with SET
+# UP where START belongs and no STOP button, over a harness that was installed,
+# running, and on screen in the WebView. Only a resume fixed it, because a resume
+# runs a check — so the wrong screen is what you see if you look at the app
+# instead of leaving it and coming back.
+contains "a finished setup reports the install" "info installed yes" "$out"
+contains "and the harness" "info harness yes" "$out"
+contains "and the payload id" "info payload" "$out"
+contains "and the posture" "info posture landlock-full" "$out"
+# The property that matters is not a list of lines but that the two verbs agree:
+# whatever a check would tell the app, a finished setup has already told it.
+check "a finished setup reports the same state a check reports" \
+  "$(DSH_BASE="$BASE" DSHD_DRY_RUN=1 sh "$BASE/bin/dshd" setup --check 2>&1 |
+    awk '$1 == "##dshd" && $3 == "info" { print $4, $5 }' | sort | tr '\n' ' ')" \
+  "$(printf '%s\n' "$out" | awk '$1 == "##dshd" && $3 == "info" { print $4, $5 }' | sort | tr '\n' ' ')"
+contains "the state block comes before done" "yes" \
+  "$(printf '%s\n' "$out" | awk '/^##dshd .* info installed yes/{i=NR} /^##dshd .* done /{d=NR} END{print (i && d && i < d) ? "yes" : "no"}')"
 
 # rootfs-setup.sh is absent because its step skipped: not running a tool that
 # has nothing to do is the point of the skip.

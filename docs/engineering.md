@@ -477,6 +477,62 @@ that a device would have blamed on Android:
   already gitignored), a keystore left inside an old build directory is adopted
   rather than orphaned, and a case in `tests/apk.test.sh` builds twice and compares
   the certificates.
+- **The page could not attach a file, and said nothing about it.** The harness
+  puts a paperclip in its composer and opens a plain `<input type="file" multiple
+  hidden>` — one line of the UI bundle, and the way a person hands the agent
+  something they did not type. A WebView routes that input through
+  `WebChromeClient.onShowFileChooser`, and this app had no `WebChromeClient` at
+  all, so the WebView answered the page's request *for* it with null: no picker,
+  no error, no event the page could report, nothing in the log. Tapping the
+  paperclip did nothing at all. The same harness in a browser attaches files
+  normally, which is exactly why this reads as "the app cannot upload" rather
+  than "the input is unhandled" — the browser was the control. Found by using it,
+  not by a test, and no host test could have found it: rendering a WebView needs
+  a phone. The picker is now answered with the page's own parameters
+  (`createIntent()`), the result comes back through `onActivityResult`, and the
+  three things that are easy to get wrong are written down and pinned by
+  `tests/apk.test.sh`: the callback is invoked on *every* exit path, because an
+  unanswered file input is dead for the life of the page and a device with no
+  picker would otherwise wait forever; the result is read from the intent's
+  `ClipData` as well as its data URI, because `FileChooserParams.parseResult`
+  reads `getData()` alone and the `multiple` input the harness uses returns every
+  file after the first in the `ClipData` (Chromium's own dialog reads it the same
+  way, which is where the shape comes from); and the result is checked before the
+  page sees it, because a file chooser result is untrusted input that can name
+  this app's own files. It needs no permission — the system picker grants a read
+  on the one file chosen — and `tests/apk.test.sh` holds that too, by refusing
+  `READ_EXTERNAL_STORAGE`, `READ_MEDIA_IMAGES` and `CAMERA` in the built APK.
+- **A restarted harness handed the guard a token that was already dead.** The
+  harness mints a fresh launch token every time it starts and prints it once, on
+  the URL line; `dshd` reads it back out of `harness.log`, because that line is
+  the only place the process publishes it. `harness.log` is *appended to* across
+  restarts, and the capture took the last matching line in the whole file — so on
+  any start after the first, the previous run's token was already on disk,
+  already matched, and was captured immediately, without waiting for the harness
+  that was starting. The guard was then launched holding a token the new harness
+  had never issued, and every login answered
+
+      502 the guard could not open a harness session behind this login.
+      upstream bootstrap answered 401 with 0 session cookie(s); expected 303 and a
+      set-cookie — the harness launch-token contract changed
+
+  A device showed exactly that, and it is the worst shape available: both ports
+  listened, `dshd status` was green, the supervisor was healthy, the harness was
+  running, and the UI was unreachable — with the guard's own error text blaming
+  the harness version, which had not changed. It followed every restart, which on
+  a phone means every `STOP` + `START` and every crash the supervisor recovers
+  from, and a first run escaped it only because a first run has an empty log. The
+  suite could not see it: the stand-in harness printed a *constant* token, so
+  "captured now" and "captured from the process that just died" were the same
+  string, and the one shape of harness that cannot exist on a device was the one
+  the tests were built around. The capture now takes the log size at the moment
+  the harness is spawned and reads only what was written after it, and the
+  stand-in mints a token per process and answers the bootstrap contract (303 with
+  a session cookie for the current token, 401 for anything else). The new case
+  kills the harness, waits for the supervisor's replacement, and asserts both
+  halves: the captured token is the one the *running* harness printed, and a
+  login through the guard answers 303 rather than 502. With the fix removed it
+  fails with the phone's exact 502; before it existed, it could not fail at all.
 
 ## Corrections to the plan found while implementing
 
